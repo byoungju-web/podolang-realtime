@@ -1,0 +1,669 @@
+/**
+ * 🍇 PODOLANG REALTIME — Full-Duplex 전화 통역
+ * Cloudflare Workers + Durable Object · v2.0
+ * © 2026 BJ LEE. All Rights Reserved.  (BJ LEE 전용)
+ *
+ * 구조 (양쪽이 동시에 말하고 동시에 들림)
+ *
+ *   [내 폰 브라우저]  --WS(PCM16 24k)-->  [Durable Object]  --WS-->  [OpenAI 통역세션 A]
+ *                                              |                        (출력=상대 언어)
+ *                                              |                              |
+ *                                              +--------- μ-law 8k ----------+
+ *                                              |
+ *                                              v
+ *                                       [Twilio Media Stream] --> 상대 전화
+ *
+ *   상대 전화 --> Twilio(μ-law 8k) --> DO --> [OpenAI 통역세션 B] --> 내 폰 (출력=내 언어)
+ *
+ * 두 방향이 완전히 독립된 세션이라 동시에 말해도 서로 막지 않습니다 = Full-Duplex.
+ *
+ * 태국어 예외
+ *   gpt-realtime-translate 의 출력 언어 13개에 태국어가 없습니다.
+ *   → 상대(태국어) → 나(한국어) 방향은 실시간 그대로 작동
+ *   → 나(한국어) → 상대(태국어) 방향만 체인 방식으로 처리 (/api/rt/say)
+ *     Whisper → GPT → ElevenLabs(ulaw_8000) → 통화에 바로 주입
+ */
+
+/* ===================== 설정 ===================== */
+
+// 지역차단이 나면 아래를 AI Gateway 주소로 바꾸세요 (기존 워커가 그렇게 우회 중입니다)
+// 예: wss://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY>/openai/v1/realtime/translations
+const RT_URL = 'wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate';
+const RT_MODEL_NOTE = 'gpt-realtime-translate';
+
+// 체인 폴백(태국어 등)에 쓰는 기존 파이프라인 — 지역차단 우회를 위해 게이트웨이 경유
+const CF_ACCOUNT_ID = '8e3361d320715cc98e7b66cb3127ca76';
+const CF_GATEWAY = 'podolang';
+const OPENAI_HTTP = `https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${CF_GATEWAY}/openai`;
+
+// gpt-realtime-translate 가 "소리로 내보낼 수 있는" 13개 언어 (소문자 ISO-639-1)
+const RT_OUT = ['es','pt','fr','ja','ru','zh','de','ko','hi','id','vi','it','en'];
+
+// 체인 폴백에서 쓸 ElevenLabs 목소리 (Sarah)
+const VOICE_DEFAULT = 'EXAVITQu4vr4xnSDxMaL';
+
+const ALLOWED = [
+  'https://podolang.kr',
+  'https://www.podolang.kr',
+  'https://byoungju-web.github.io',
+  'http://localhost:8788'
+];
+
+const LC = { KO:'ko', TH:'th', EN:'en', JA:'ja', ZH:'zh', VI:'vi', ES:'es', ID:'id',
+             DE:'de', FR:'fr', AR:'ar', IT:'it', RU:'ru', PT:'pt', HI:'hi' };
+const lc = v => LC[String(v||'').toUpperCase()] || String(v||'en').toLowerCase();
+const rtOk = v => RT_OUT.includes(lc(v));
+
+/* ===================== Worker 진입점 ===================== */
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const H = cors(request);
+    if (request.method === 'OPTIONS') return new Response(null, { headers: H });
+
+    try {
+      // 상태 확인
+      if (url.pathname === '/api/rt/health') {
+        return json({
+          ok: true, app: 'podolang-realtime', version: '2.0',
+          model: RT_MODEL_NOTE,
+          realtimeOutputLangs: RT_OUT,
+          keys: {
+            openai: !!env.OPENAI_API_KEY,
+            elevenlabs: !!env.ELEVENLABS_API_KEY,
+            twilio: !!(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_PHONE_NUMBER),
+            durableObject: !!env.CALL
+          }
+        }, 200, H);
+      }
+
+      // 언어 조합 미리 확인 — 앱이 "실시간 되는지"를 먼저 물어봅니다
+      if (url.pathname === '/api/rt/check') {
+        const me = lc(url.searchParams.get('me') || 'ko');
+        const peer = lc(url.searchParams.get('peer') || 'en');
+        return json({
+          ok: true,
+          peerToMe: rtOk(me) ? 'realtime' : 'unsupported',
+          meToPeer: rtOk(peer) ? 'realtime' : 'chained',
+          note: rtOk(peer) ? '양방향 실시간입니다.'
+                           : '상대 말은 실시간으로 들리고, 내 말은 2초쯤 뒤에 전달됩니다.'
+        }, 200, H);
+      }
+
+      // 1. 통화 시작 — 상대에게 전화를 겁니다
+      if (url.pathname === '/api/rt/start' && request.method === 'POST') {
+        if (!env.CALL) return json({ error: 'Durable Object(CALL)가 연결되지 않았습니다.' }, 400, H);
+        if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_PHONE_NUMBER) {
+          return json({ error: 'Twilio 설정이 없습니다.' }, 400, H);
+        }
+        const { to, myLang, peerLang } = await request.json();
+        if (!/^\+\d{8,15}$/.test(to || '')) {
+          return json({ error: '전화번호는 +82… 처럼 국가번호부터 넣어주세요.' }, 400, H);
+        }
+        const me = lc(myLang || 'ko'), peer = lc(peerLang || 'en');
+        if (!rtOk(me)) {
+          return json({ error: `내 언어(${me})는 실시간 통역이 지원하지 않습니다. 지원: ${RT_OUT.join(', ')}` }, 400, H);
+        }
+
+        // 방(room) 하나가 통화 하나. Durable Object 인스턴스를 이 이름으로 잡습니다.
+        const room = crypto.randomUUID().slice(0, 12);
+        const stub = env.CALL.get(env.CALL.idFromName(room));
+
+        // 언어와 방 정보를 먼저 넣어둡니다 (Twilio가 붙기 전에)
+        await stub.fetch(new Request('https://do/config', {
+          method: 'POST',
+          body: JSON.stringify({ room, me, peer, mode: rtOk(peer) ? 'realtime' : 'chained' })
+        }));
+
+        // Twilio 아웃바운드 콜
+        const auth = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`);
+        const form = new URLSearchParams();
+        form.append('To', to);
+        form.append('From', env.TWILIO_PHONE_NUMBER);
+        form.append('Url', `${url.origin}/twiml/rt?room=${room}&peer=${peer}`);
+        form.append('StatusCallback', `${url.origin}/api/rt/status?room=${room}`);
+        form.append('StatusCallbackEvent', 'completed');
+
+        const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Calls.json`, {
+          method: 'POST',
+          headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: form
+        });
+        const d = await res.json();
+        if (d.code) return json({ error: d.message }, 400, H);
+
+        await stub.fetch(new Request('https://do/callsid', {
+          method: 'POST', body: JSON.stringify({ callSid: d.sid })
+        }));
+
+        return json({
+          ok: true, room, callSid: d.sid,
+          wsUrl: `${url.origin.replace(/^http/, 'ws')}/rt/app?room=${room}`,
+          mode: rtOk(peer) ? 'realtime' : 'chained',
+          message: `${to} 로 거는 중입니다.`
+        }, 200, H);
+      }
+
+      // 2. Twilio가 상대 전화를 연결하면 호출하는 TwiML
+      //    <Connect><Stream> 은 통화를 점유하는 종결 verb 입니다.
+      //    뒤에 <Dial> 같은 걸 붙이면 실행되지 않으니 넣지 마세요.
+      if (url.pathname === '/twiml/rt') {
+        const room = url.searchParams.get('room') || '';
+        const ws = `${url.origin.replace(/^http/, 'ws')}/rt/twilio?room=${room}`;
+        return xml(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="${escXml(ws)}">
+      <Parameter name="room" value="${escXml(room)}"/>
+    </Stream>
+  </Connect>
+</Response>`);
+      }
+
+      // 3. WebSocket 두 갈래 — 둘 다 같은 Durable Object 로 넘깁니다
+      if (url.pathname === '/rt/app' || url.pathname === '/rt/twilio') {
+        if (request.headers.get('Upgrade') !== 'websocket') {
+          return new Response('WebSocket 연결이 필요합니다.', { status: 426 });
+        }
+        const room = url.searchParams.get('room') || '';
+        if (!room) return new Response('room 없음', { status: 400 });
+        const stub = env.CALL.get(env.CALL.idFromName(room));
+        const side = url.pathname === '/rt/app' ? 'app' : 'twilio';
+        return stub.fetch(new Request(`https://do/ws/${side}`, request));
+      }
+
+      // 4. 체인 폴백 — 실시간이 안 되는 언어(태국어 등)로 내 말을 보낼 때
+      if (url.pathname === '/api/rt/say' && request.method === 'POST') {
+        const fd = await request.formData();
+        const room = String(fd.get('room') || '');
+        const audio = fd.get('audio');
+        if (!room) return json({ error: 'room 없음' }, 400, H);
+
+        const stub = env.CALL.get(env.CALL.idFromName(room));
+        const infoRes = await stub.fetch(new Request('https://do/info'));
+        const info = await infoRes.json();
+        if (!info.ok) return json({ error: '통화를 찾을 수 없습니다.' }, 404, H);
+
+        // 내 말 → 텍스트 → 상대 언어 → μ-law 8k 음성
+        const said = await transcribe(env, audio, info.me);
+        if (!said || !said.trim()) return json({ error: '음성을 인식하지 못했습니다.' }, 400, H);
+        const translated = await translateText(env, said, info.me, info.peer);
+        const ulaw = await ttsUlaw(env, translated, info.peer);
+
+        // Durable Object 를 통해 통화에 밀어넣습니다
+        await stub.fetch(new Request('https://do/inject', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: ulaw
+        }));
+
+        return json({ ok: true, src: said, translated }, 200, H);
+      }
+
+      // 5. 통화 종료
+      if (url.pathname === '/api/rt/end' && request.method === 'POST') {
+        const { room } = await request.json();
+        if (room && env.CALL) {
+          const stub = env.CALL.get(env.CALL.idFromName(room));
+          const r = await stub.fetch(new Request('https://do/info'));
+          const info = await r.json();
+          if (info.callSid && env.TWILIO_ACCOUNT_SID) {
+            try {
+              const auth = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`);
+              const f = new URLSearchParams(); f.append('Status', 'completed');
+              await fetch(`https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Calls/${info.callSid}.json`, {
+                method: 'POST',
+                headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: f
+              });
+            } catch (_) {}
+          }
+          await stub.fetch(new Request('https://do/end', { method: 'POST' }));
+        }
+        return json({ ok: true }, 200, H);
+      }
+
+      // 6. Twilio 콜 상태 콜백
+      if (url.pathname === '/api/rt/status' && request.method === 'POST') {
+        const room = url.searchParams.get('room') || '';
+        try {
+          const fd = await request.formData();
+          if (room && env.CALL && String(fd.get('CallStatus')) === 'completed') {
+            const stub = env.CALL.get(env.CALL.idFromName(room));
+            await stub.fetch(new Request('https://do/end', { method: 'POST' }));
+          }
+        } catch (_) {}
+        return new Response('OK');
+      }
+
+      return new Response('🍇 PodoLang Realtime · v2.0 · © BJ LEE', { headers: H });
+
+    } catch (e) {
+      return json({ error: e.message || '처리 중 오류가 발생했습니다.' }, 500, H);
+    }
+  }
+};
+
+/* ===================== Durable Object: 통화 하나 = 인스턴스 하나 ===================== */
+
+export class CallSession {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+
+    this.app = null;        // 내 폰 브라우저 소켓
+    this.twilio = null;     // Twilio Media Stream 소켓
+    this.streamSid = null;
+
+    this.me = 'ko';         // 내 언어
+    this.peer = 'en';       // 상대 언어
+    this.mode = 'realtime'; // realtime | chained (내 말 → 상대 방향)
+    this.room = '';
+    this.callSid = '';
+
+    this.sessMe = null;     // OpenAI 세션: 상대 말 → 내 언어
+    this.sessPeer = null;   // OpenAI 세션: 내 말 → 상대 언어
+    this.closed = false;
+
+    // 상대에게 나갈 μ-law 프레임 큐 (20ms = 160바이트씩 흘려보냄)
+    this.outQueue = [];
+    this.pump = null;
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    const p = url.pathname;
+
+    if (p === '/config') {
+      const b = await request.json();
+      this.room = b.room || '';
+      this.me = b.me || 'ko';
+      this.peer = b.peer || 'en';
+      this.mode = b.mode || 'realtime';
+      return json({ ok: true });
+    }
+    if (p === '/callsid') {
+      const b = await request.json();
+      this.callSid = b.callSid || '';
+      return json({ ok: true });
+    }
+    if (p === '/info') {
+      return json({
+        ok: !this.closed, room: this.room, me: this.me, peer: this.peer,
+        mode: this.mode, callSid: this.callSid,
+        appUp: !!this.app, phoneUp: !!this.twilio
+      });
+    }
+    if (p === '/inject') {
+      // 체인 폴백으로 만든 μ-law 음성을 통화에 밀어넣습니다
+      const buf = new Uint8Array(await request.arrayBuffer());
+      this.enqueueToPeer(buf);
+      return json({ ok: true, bytes: buf.length });
+    }
+    if (p === '/end') { this.shutdown('요청'); return json({ ok: true }); }
+
+    if (p === '/ws/app')    return this.accept(request, 'app');
+    if (p === '/ws/twilio') return this.accept(request, 'twilio');
+
+    return new Response('not found', { status: 404 });
+  }
+
+  accept(request, side) {
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
+
+    if (side === 'app') {
+      this.app = server;
+      server.addEventListener('message', e => this.onAppMessage(e));
+      server.addEventListener('close', () => { this.app = null; this.shutdown('앱 종료'); });
+      server.addEventListener('error', () => { this.app = null; });
+      this.toApp({ type: 'status', state: 'app-connected', mode: this.mode });
+    } else {
+      this.twilio = server;
+      server.addEventListener('message', e => this.onTwilioMessage(e));
+      server.addEventListener('close', () => { this.twilio = null; this.shutdown('통화 종료'); });
+      server.addEventListener('error', () => { this.twilio = null; });
+    }
+
+    this.maybeStart();
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /* ---------- 두 다리가 다 붙으면 OpenAI 통역 세션을 엽니다 ---------- */
+  async maybeStart() {
+    if (!this.app || !this.twilio) return;
+    if (this.sessMe || this.sessPeer) return;
+
+    // 방향 1: 상대 말 → 내 언어 (항상 실시간)
+    this.sessMe = await this.openTranslate(this.me, 'peer→me');
+    // 방향 2: 내 말 → 상대 언어 (상대 언어가 지원될 때만 실시간)
+    if (this.mode === 'realtime') {
+      this.sessPeer = await this.openTranslate(this.peer, 'me→peer');
+    }
+    this.startPump();
+    this.toApp({ type: 'status', state: 'ready', mode: this.mode });
+  }
+
+  /**
+   * OpenAI 통역 세션 열기.
+   * Workers 에서는 new WebSocket(url,{headers}) 로 헤더를 못 붙입니다.
+   * fetch 에 Upgrade 헤더를 실어 보내고 응답의 webSocket 을 accept() 해야 합니다.
+   */
+  async openTranslate(outLang, tag) {
+    try {
+      const res = await fetch(RT_URL, {
+        headers: {
+          Upgrade: 'websocket',
+          Authorization: `Bearer ${this.env.OPENAI_API_KEY}`
+        }
+      });
+      const ws = res.webSocket;
+      if (!ws) { this.toApp({ type: 'error', text: `통역 세션 연결 실패 (${tag})` }); return null; }
+      ws.accept();
+
+      ws.send(JSON.stringify({
+        type: 'session.update',
+        session: {
+          audio: {
+            input: {
+              transcription: { model: 'gpt-realtime-whisper' },
+              noise_reduction: { type: 'near_field' }
+            },
+            output: { language: outLang }
+          }
+        }
+      }));
+
+      ws.addEventListener('message', ev => this.onModelMessage(ev, tag));
+      ws.addEventListener('close', () => this.toApp({ type: 'status', state: `closed:${tag}` }));
+      ws.addEventListener('error', () => this.toApp({ type: 'error', text: `통역 세션 오류 (${tag})` }));
+      return ws;
+    } catch (e) {
+      this.toApp({ type: 'error', text: `통역 세션 예외 (${tag}): ${e.message}` });
+      return null;
+    }
+  }
+
+  /* ---------- OpenAI → 우리 ---------- */
+  onModelMessage(ev, tag) {
+    let d;
+    try { d = JSON.parse(ev.data); } catch (_) { return; }
+
+    // 번역된 음성 (base64 PCM16 24kHz, 200ms 단위)
+    if (d.type === 'session.output_audio.delta' && d.delta) {
+      const pcm24 = b64ToI16(d.delta);
+      if (tag === 'me→peer') {
+        // 내 말이 상대 언어로 번역됨 → 전화로
+        this.enqueueToPeer(i16ToUlaw(down24to8(pcm24)));
+      } else {
+        // 상대 말이 내 언어로 번역됨 → 내 폰으로 (PCM16 24k 그대로)
+        this.toApp({ type: 'audio', audio: d.delta });
+      }
+      return;
+    }
+
+    // 번역문 자막
+    if (d.type === 'session.output_transcript.delta' && d.delta) {
+      this.toApp({ type: 'text', dir: tag === 'me→peer' ? 'me' : 'peer', delta: d.delta });
+      return;
+    }
+    if (d.type === 'session.output_transcript.done') {
+      this.toApp({ type: 'text_done', dir: tag === 'me→peer' ? 'me' : 'peer' });
+      return;
+    }
+    if (d.type === 'error') {
+      this.toApp({ type: 'error', text: (d.error && d.error.message) || '통역 오류' });
+    }
+  }
+
+  /* ---------- 내 폰 → 우리 ---------- */
+  onAppMessage(ev) {
+    let d;
+    try { d = JSON.parse(ev.data); } catch (_) { return; }
+
+    if (d.type === 'audio' && d.audio) {
+      // 브라우저가 보낸 PCM16 24kHz 를 그대로 통역 세션에 흘려보냅니다.
+      // 조용한 구간도 계속 보내야 합니다 — 턴 방식이 아니라서 끊으면 맥락이 깨집니다.
+      if (this.sessPeer && this.sessPeer.readyState === 1) {
+        this.sessPeer.send(JSON.stringify({
+          type: 'session.input_audio_buffer.append',
+          audio: d.audio
+        }));
+      }
+      return;
+    }
+    if (d.type === 'bye') this.shutdown('앱 종료 요청');
+  }
+
+  /* ---------- Twilio → 우리 ---------- */
+  onTwilioMessage(ev) {
+    let d;
+    try { d = JSON.parse(ev.data); } catch (_) { return; }
+
+    if (d.event === 'start') {
+      this.streamSid = d.start && d.start.streamSid;
+      this.toApp({ type: 'status', state: 'phone-connected' });
+      return;
+    }
+    if (d.event === 'media' && d.media && d.media.payload) {
+      // Twilio: base64 μ-law 8kHz → PCM16 24kHz 로 올려서 통역 세션에
+      if (this.sessMe && this.sessMe.readyState === 1) {
+        const pcm24 = up8to24(ulawToI16(b64ToBytes(d.media.payload)));
+        this.sessMe.send(JSON.stringify({
+          type: 'session.input_audio_buffer.append',
+          audio: i16ToB64(pcm24)
+        }));
+      }
+      return;
+    }
+    if (d.event === 'stop') this.shutdown('통화 끊김');
+  }
+
+  /* ---------- 상대에게 나갈 소리: 20ms 프레임으로 고르게 흘려보냄 ---------- */
+  enqueueToPeer(ulawBytes) {
+    for (let i = 0; i < ulawBytes.length; i += 160) {
+      this.outQueue.push(ulawBytes.subarray(i, Math.min(i + 160, ulawBytes.length)));
+    }
+  }
+  startPump() {
+    if (this.pump) return;
+    // 20ms 마다 한 프레임. 한꺼번에 쏟으면 Twilio 쪽에서 소리가 뭉갭니다.
+    this.pump = setInterval(() => {
+      if (this.closed) return;
+      const f = this.outQueue.shift();
+      if (!f || !this.twilio || this.twilio.readyState !== 1 || !this.streamSid) return;
+      try {
+        this.twilio.send(JSON.stringify({
+          event: 'media',
+          streamSid: this.streamSid,
+          media: { payload: bytesToB64(f) }
+        }));
+      } catch (_) {}
+    }, 20);
+  }
+
+  toApp(obj) {
+    if (this.app && this.app.readyState === 1) {
+      try { this.app.send(JSON.stringify(obj)); } catch (_) {}
+    }
+  }
+
+  shutdown(why) {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.pump) { clearInterval(this.pump); this.pump = null; }
+    this.outQueue = [];
+    this.toApp({ type: 'status', state: 'ended', why });
+    for (const s of [this.sessMe, this.sessPeer, this.twilio, this.app]) {
+      try { s && s.close(); } catch (_) {}
+    }
+    this.sessMe = this.sessPeer = this.twilio = this.app = null;
+  }
+}
+
+/* ===================== 체인 폴백 (태국어 등) ===================== */
+
+async function transcribe(env, audio, lang) {
+  if (!audio) throw new Error('음성이 없습니다.');
+  const form = new FormData();
+  form.append('file', audio, 'audio.webm');
+  form.append('model', 'whisper-1');
+  if (lang) form.append('language', lc(lang));
+  const res = await fetch(`${OPENAI_HTTP}/audio/transcriptions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+    body: form
+  });
+  const d = await res.json();
+  if (d.error) throw new Error('음성 인식 실패: ' + d.error.message);
+  return d.text;
+}
+
+async function translateText(env, text, src, dst) {
+  const res = await fetch(`${OPENAI_HTTP}/chat/completions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: `Translate from ${src} to ${dst}. This is a live phone conversation. Output only the translation — no notes, no quotes, no romanization.` },
+        { role: 'user', content: text }
+      ]
+    })
+  });
+  const d = await res.json();
+  if (d.error) throw new Error('번역 실패: ' + d.error.message);
+  const out = d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+  if (!out) throw new Error('번역 실패(응답형식)');
+  return out.trim();
+}
+
+// ElevenLabs 를 ulaw_8000 으로 뽑으면 Twilio 에 그대로 넣을 수 있습니다 (변환 불필요)
+async function ttsUlaw(env, text, lang) {
+  if (!env.ELEVENLABS_API_KEY) throw new Error('ElevenLabs 키가 없습니다.');
+  const models = ['eleven_v3', 'eleven_turbo_v2_5', 'eleven_flash_v2_5'];
+  const errs = [];
+  for (const m of models) {
+    try {
+      const body = { text, model_id: m, voice_settings: { stability: 0.5, similarity_boost: 0.75 } };
+      if (m !== 'eleven_multilingual_v2') body.language_code = lc(lang);
+      const res = await fetch(
+        `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_DEFAULT}?output_format=ulaw_8000`, {
+        method: 'POST',
+        headers: { 'xi-api-key': env.ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) { errs.push(`${m}: HTTP ${res.status}`); continue; }
+      return new Uint8Array(await res.arrayBuffer());
+    } catch (e) { errs.push(`${m}: ${e.message}`); }
+  }
+  throw new Error('음성 생성 실패 · ' + errs.join(' | '));
+}
+
+/* ===================== 오디오 변환 =====================
+   Twilio  : 8kHz μ-law
+   OpenAI  : 24kHz PCM16 (little-endian)
+   둘 사이를 오갈 때마다 디코드 + 리샘플이 필요합니다.            */
+
+// μ-law 1바이트 → PCM16 (Sun 표준 알고리즘)
+function ulawToI16(bytes) {
+  const out = new Int16Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) {
+    const u = ~bytes[i] & 0xFF;
+    let t = ((u & 0x0F) << 3) + 0x84;
+    t <<= (u & 0x70) >> 4;
+    out[i] = (u & 0x80) ? (0x84 - t) : (t - 0x84);
+  }
+  return out;
+}
+
+// PCM16 → μ-law 1바이트
+const EXP_LUT = (() => {
+  const t = new Uint8Array(256);
+  for (let i = 1; i < 256; i++) t[i] = 31 - Math.clz32(i);
+  t[0] = 0;
+  return t;
+})();
+function i16ToUlaw(samples) {
+  const CLIP = 32635, BIAS = 0x84;
+  const out = new Uint8Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    let s = samples[i];
+    const sign = (s >> 8) & 0x80;
+    if (sign) s = -s;
+    if (s > CLIP) s = CLIP;
+    s += BIAS;
+    const exp = EXP_LUT[(s >> 7) & 0xFF];
+    const man = (s >> (exp + 3)) & 0x0F;
+    out[i] = ~(sign | (exp << 4) | man) & 0xFF;
+  }
+  return out;
+}
+
+// 8kHz → 24kHz (선형 보간으로 3배)
+function up8to24(src) {
+  const n = src.length;
+  const out = new Int16Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const a = src[i];
+    const b = (i + 1 < n) ? src[i + 1] : a;
+    const step = (b - a) / 3;
+    out[i * 3]     = a;
+    out[i * 3 + 1] = a + step;
+    out[i * 3 + 2] = a + step * 2;
+  }
+  return out;
+}
+
+// 24kHz → 8kHz (3개 평균 — 그냥 버리면 잡음이 낍니다)
+function down24to8(src) {
+  const n = Math.floor(src.length / 3);
+  const out = new Int16Array(n);
+  for (let i = 0; i < n; i++) {
+    out[i] = ((src[i * 3] + src[i * 3 + 1] + src[i * 3 + 2]) / 3) | 0;
+  }
+  return out;
+}
+
+/* ---------- base64 ---------- */
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function bytesToB64(bytes) {
+  let bin = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+function b64ToI16(b64) {
+  const bytes = b64ToBytes(b64);
+  return new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength >> 1);
+}
+function i16ToB64(samples) {
+  return bytesToB64(new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength));
+}
+
+/* ---------- 기타 ---------- */
+const escXml = s => String(s).replace(/[&<>"']/g,
+  c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c]));
+
+function cors(request) {
+  const origin = request.headers.get('Origin') || '';
+  return {
+    'Access-Control-Allow-Origin': ALLOWED.includes(origin) ? origin : ALLOWED[0],
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Vary': 'Origin'
+  };
+}
+const xml = body => new Response(body, { headers: { 'Content-Type': 'text/xml' } });
+const json = (obj, status = 200, H = {}) =>
+  new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json', ...H } });
