@@ -66,7 +66,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '2.1',
+          ok: true, app: 'podolang-realtime', version: '2.2',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
@@ -510,10 +510,19 @@ export class CallSession {
   }
 
   /* ---------- 상대에게 나갈 소리: 20ms 프레임으로 고르게 흘려보냄 ---------- */
+  // 20ms 프레임 = 1개. 150개면 3초치입니다.
+  // 모델이 실제 말하는 속도보다 빠르게 내보내면 큐가 계속 길어져서
+  // 상대가 듣는 소리가 점점 뒤로 밀립니다. 일정 길이를 넘으면 앞을 버리고 따라잡습니다.
   enqueueToPeer(ulawBytes) {
     for (let i = 0; i < ulawBytes.length; i += 160) {
       this.outQueue.push(ulawBytes.subarray(i, Math.min(i + 160, ulawBytes.length)));
       this.c.toPeerFrames++;
+    }
+    const MAX_Q = 150;   // 3초
+    if (this.outQueue.length > MAX_Q) {
+      const drop = this.outQueue.length - 100;   // 2초치만 남깁니다
+      this.outQueue.splice(0, drop);
+      this.c.dropped = (this.c.dropped || 0) + drop;
     }
   }
   startPump() {
@@ -521,16 +530,21 @@ export class CallSession {
     // 20ms 마다 한 프레임. 한꺼번에 쏟으면 Twilio 쪽에서 소리가 뭉갭니다.
     this.pump = setInterval(() => {
       if (this.closed) return;
-      const f = this.outQueue.shift();
-      if (!f || !this.twilio || this.twilio.readyState !== 1 || !this.streamSid) return;
-      try {
-        this.twilio.send(JSON.stringify({
-          event: 'media',
-          streamSid: this.streamSid,
-          media: { payload: bytesToB64(f) }
-        }));
-        this.c.sentToTwilio++;
-      } catch (_) {}
+      if (!this.twilio || this.twilio.readyState !== 1 || !this.streamSid) return;
+      // 밀려 있으면 한 번에 두 프레임씩 빼서 조금씩 따라잡습니다
+      const burst = this.outQueue.length > 60 ? 2 : 1;
+      for (let k = 0; k < burst; k++) {
+        const f = this.outQueue.shift();
+        if (!f) return;
+        try {
+          this.twilio.send(JSON.stringify({
+            event: 'media',
+            streamSid: this.streamSid,
+            media: { payload: bytesToB64(f) }
+          }));
+          this.c.sentToTwilio++;
+        } catch (_) { return; }
+      }
     }, 20);
   }
 
