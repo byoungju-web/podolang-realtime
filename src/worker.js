@@ -66,7 +66,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '2.0',
+          ok: true, app: 'podolang-realtime', version: '2.1',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
@@ -201,6 +201,15 @@ export default {
         return json({ ok: true, src: said, translated }, 200, H);
       }
 
+      // 4-1. 진단 — 통화 중에 브라우저로 열어서 어디서 끊기는지 봅니다
+      if (url.pathname === '/api/rt/debug') {
+        const room = url.searchParams.get('room') || '';
+        if (!room || !env.CALL) return json({ error: 'room 파라미터가 필요합니다.' }, 400, H);
+        const stub = env.CALL.get(env.CALL.idFromName(room));
+        const r = await stub.fetch(new Request('https://do/debug'));
+        return new Response(await r.text(), { headers: { 'Content-Type': 'application/json', ...H } });
+      }
+
       // 5. 통화 종료
       if (url.pathname === '/api/rt/end' && request.method === 'POST') {
         const { room } = await request.json();
@@ -269,6 +278,17 @@ export class CallSession {
     // 상대에게 나갈 μ-law 프레임 큐 (20ms = 160바이트씩 흘려보냄)
     this.outQueue = [];
     this.pump = null;
+
+    // 어디서 끊기는지 보려고 세는 값들 (/api/rt/debug?room= 에서 확인)
+    this.c = {
+      twStart: 0, twMedia: 0, twOther: 0, twBytes: 0,
+      tracks: {},                 // Twilio 가 어떤 track 을 보내는지
+      toSessMe: 0, toSessMeBytes: 0,
+      meAudioDelta: 0, meTextDelta: 0,
+      peerAudioDelta: 0, peerTextDelta: 0,
+      toPeerFrames: 0, sentToTwilio: 0,
+      lastErr: '', lastEvent: ''
+    };
   }
 
   async fetch(request) {
@@ -300,6 +320,15 @@ export class CallSession {
       const buf = new Uint8Array(await request.arrayBuffer());
       this.enqueueToPeer(buf);
       return json({ ok: true, bytes: buf.length });
+    }
+    if (p === '/debug') {
+      const st = w => w ? w.readyState : -1;   // 1 = 열림
+      return json({
+        ok: !this.closed, room: this.room, me: this.me, peer: this.peer, mode: this.mode,
+        appUp: !!this.app, phoneUp: !!this.twilio, streamSid: this.streamSid || null,
+        sessMeState: st(this.sessMe), sessPeerState: st(this.sessPeer),
+        counters: this.c, queued: this.outQueue.length
+      });
     }
     if (p === '/end') { this.shutdown('요청'); return json({ ok: true }); }
 
@@ -393,6 +422,7 @@ export class CallSession {
 
     // 번역된 음성 (base64 PCM16 24kHz, 200ms 단위)
     if (d.type === 'session.output_audio.delta' && d.delta) {
+      if (tag === 'me→peer') this.c.peerAudioDelta++; else this.c.meAudioDelta++;
       const pcm24 = b64ToI16(d.delta);
       if (tag === 'me→peer') {
         // 내 말이 상대 언어로 번역됨 → 전화로
@@ -406,6 +436,7 @@ export class CallSession {
 
     // 번역문 자막
     if (d.type === 'session.output_transcript.delta' && d.delta) {
+      if (tag === 'me→peer') this.c.peerTextDelta++; else this.c.meTextDelta++;
       this.toApp({ type: 'text', dir: tag === 'me→peer' ? 'me' : 'peer', delta: d.delta });
       return;
     }
@@ -414,7 +445,9 @@ export class CallSession {
       return;
     }
     if (d.type === 'error') {
-      this.toApp({ type: 'error', text: (d.error && d.error.message) || '통역 오류' });
+      const msg = (d.error && d.error.message) || JSON.stringify(d).slice(0, 200);
+      this.c.lastErr = `[${tag}] ${msg}`;
+      this.toApp({ type: 'error', text: msg });
     }
   }
 
@@ -431,6 +464,7 @@ export class CallSession {
           type: 'session.input_audio_buffer.append',
           audio: d.audio
         }));
+        this.c.fromApp = (this.c.fromApp || 0) + 1;
       }
       return;
     }
@@ -442,29 +476,44 @@ export class CallSession {
     let d;
     try { d = JSON.parse(ev.data); } catch (_) { return; }
 
+    this.c.lastEvent = d.event || '?';
+
     if (d.event === 'start') {
+      this.c.twStart++;
       this.streamSid = d.start && d.start.streamSid;
       this.toApp({ type: 'status', state: 'phone-connected' });
       return;
     }
     if (d.event === 'media' && d.media && d.media.payload) {
+      this.c.twMedia++;
+      const tr = d.media.track || 'unknown';
+      this.c.tracks[tr] = (this.c.tracks[tr] || 0) + 1;
+
       // Twilio: base64 μ-law 8kHz → PCM16 24kHz 로 올려서 통역 세션에
+      const raw = b64ToBytes(d.media.payload);
+      this.c.twBytes += raw.length;
+
       if (this.sessMe && this.sessMe.readyState === 1) {
-        const pcm24 = up8to24(ulawToI16(b64ToBytes(d.media.payload)));
+        const pcm24 = up8to24(ulawToI16(raw));
+        const b64 = i16ToB64(pcm24);
         this.sessMe.send(JSON.stringify({
           type: 'session.input_audio_buffer.append',
-          audio: i16ToB64(pcm24)
+          audio: b64
         }));
+        this.c.toSessMe++;
+        this.c.toSessMeBytes += pcm24.length * 2;
       }
       return;
     }
     if (d.event === 'stop') this.shutdown('통화 끊김');
+    else this.c.twOther++;
   }
 
   /* ---------- 상대에게 나갈 소리: 20ms 프레임으로 고르게 흘려보냄 ---------- */
   enqueueToPeer(ulawBytes) {
     for (let i = 0; i < ulawBytes.length; i += 160) {
       this.outQueue.push(ulawBytes.subarray(i, Math.min(i + 160, ulawBytes.length)));
+      this.c.toPeerFrames++;
     }
   }
   startPump() {
@@ -480,6 +529,7 @@ export class CallSession {
           streamSid: this.streamSid,
           media: { payload: bytesToB64(f) }
         }));
+        this.c.sentToTwilio++;
       } catch (_) {}
     }, 20);
   }
