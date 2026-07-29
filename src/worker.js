@@ -96,7 +96,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '3.1',
+          ok: true, app: 'podolang-realtime', version: '3.2',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
@@ -115,13 +115,26 @@ export default {
       // 브라우저로 그냥 열면 됩니다: /api/rt/testopenai
       if (url.pathname === '/api/rt/testopenai') {
         const results = {};
-        // 주소 두 형태 × 토큰 두 형식 = 네 조합을 한 번에 시험합니다
-        results['모델파라미터_Bearer'] = await probeRealtime(env, gwUrl(env), 'bearer');
-        results['모델파라미터_토큰만']  = await probeRealtime(env, gwUrl(env), 'bare');
-        results['경로그대로_Bearer']   = await probeRealtime(env, gwUrlPath(env), 'bearer');
-        results['경로그대로_토큰만']    = await probeRealtime(env, gwUrlPath(env), 'bare');
+        const B = gwBase(env);
+        const L = { listenOnly: true };   // 아무것도 안 보내고 듣기만
+
+        // ① 통역 전용 모델 — 우리가 원하는 것
+        results['A_통역모델_듣기만'] =
+          await probeRealtime(env, `${B}?model=gpt-realtime-translate`, 'bearer', L);
+        results['B_통역모델_경로_듣기만'] =
+          await probeRealtime(env, `${B}/v1/realtime/translations?model=gpt-realtime-translate`, 'bearer', L);
+
+        // ② 게이트웨이가 문서상 지원하는 일반 실시간 모델 — 이게 되면 대안이 생깁니다
+        results['C_일반실시간_듣기만'] =
+          await probeRealtime(env, `${B}?model=gpt-realtime`, 'bearer', L);
+        results['D_구형실시간_듣기만'] =
+          await probeRealtime(env, `${B}?model=gpt-4o-realtime-preview`, 'bearer', L);
+
+        // ③ 비교용: 보내기까지 하는 기존 방식
         if (url.searchParams.get('all') === '1') {
-          results['직접연결'] = await probeRealtime(env, RT_DIRECT, null);
+          results['E_통역모델_보내기'] =
+            await probeRealtime(env, `${B}?model=gpt-realtime-translate`, 'bearer');
+          results['F_직접연결'] = await probeRealtime(env, RT_DIRECT, null, L);
         }
         return json({
           ok: true,
@@ -733,7 +746,8 @@ export class CallSession {
 /* ===================== 연결 시험 ===================== */
 // 소켓을 열어보고 무슨 일이 생기는지 그대로 돌려줍니다.
 // 지역차단이면 HTTP 403 과 본문이, 모델명이 틀리면 에러 메시지가 옵니다.
-async function probeRealtime(env, url, style) {
+async function probeRealtime(env, url, style, opts) {
+  opts = opts || {};
   url = String(url).replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
   const out = { url: url.replace(/\?.*$/, '?…'), 토큰형식: style || '없음', ok: false };
   if (!env.OPENAI_API_KEY) { out.error = 'OPENAI_API_KEY 없음'; return out; }
@@ -750,7 +764,7 @@ async function probeRealtime(env, url, style) {
     out.upgraded = true;
 
     out.firstMessage = await new Promise(resolve => {
-      const timer = setTimeout(() => resolve('(5초 동안 아무 응답 없음)'), 5000);
+      const timer = setTimeout(() => resolve('(8초 동안 아무 응답 없음)'), 8000);
       ws.addEventListener('message', e => {
         clearTimeout(timer); resolve(String(e.data).slice(0, 400));
       });
@@ -758,6 +772,9 @@ async function probeRealtime(env, url, style) {
         clearTimeout(timer); resolve(`(닫힘 code=${ev.code} reason=${ev.reason || '없음'})`);
       });
       ws.addEventListener('error', () => { clearTimeout(timer); resolve('(소켓 오류)'); });
+      // 듣기만 하는 모드: 아무것도 안 보내고 서버가 먼저 말하기를 기다립니다.
+      // OpenAI 는 연결되면 session.created 를 먼저 보냅니다.
+      if (opts.listenOnly) return;
       try {
         ws.send(JSON.stringify({
           type: 'session.update',
