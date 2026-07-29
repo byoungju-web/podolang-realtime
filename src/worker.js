@@ -41,6 +41,18 @@ const geminiUrl = env => `${GEMINI_HOST}${GEMINI_PATH}?key=${encodeURIComponent(
 // Google API 는 x-goog-api-key 헤더를 동등하게 받아줍니다.
 const geminiHeaders = env => ({ Upgrade: 'websocket', 'x-goog-api-key': geminiKey(env) });
 
+// Gemini 는 답을 바이너리 프레임으로 보냅니다.
+// 문자열·ArrayBuffer·Blob 무엇이 와도 글자로 바꿔줍니다.
+async function wsText(data) {
+  if (typeof data === 'string') return data;
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+  if (data && typeof data.text === 'function') return await data.text();
+  if (data && typeof data.arrayBuffer === 'function') {
+    return new TextDecoder().decode(await data.arrayBuffer());
+  }
+  return String(data);
+}
+
 const GEMINI_IN_RATE  = 16000;   // 우리가 보내는 소리
 const GEMINI_OUT_RATE = 24000;   // 받는 소리
 
@@ -93,7 +105,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '4.2',
+          ok: true, app: 'podolang-realtime', version: '4.3',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
@@ -560,7 +572,7 @@ export class CallSession {
         }
       }));
 
-      ws.addEventListener('message', ev => this.onModelMessage(ev, tag));
+      ws.addEventListener('message', ev => { this.onModelMessage(ev, tag); });
       ws.addEventListener('close', ev => {
         this.c.lastErr = `[${tag}] 닫힘 code=${ev.code} ${ev.reason || ''}`;
         this.toApp({ type: 'status', state: `closed:${tag}` });
@@ -588,9 +600,11 @@ export class CallSession {
   }
 
   /* ---------- OpenAI → 우리 ---------- */
-  onModelMessage(ev, tag) {
+  async onModelMessage(ev, tag) {
     let d;
-    try { d = JSON.parse(ev.data); } catch (_) { return; }
+    try {
+      d = JSON.parse(await wsText(ev.data));
+    } catch (_) { return; }
 
     // 준비 완료 — 이제부터 소리를 보낼 수 있습니다
     if (d.setupComplete) {
@@ -775,7 +789,7 @@ async function probeGemini(env, lang) {
     키있음: !!k,
     키길이: k.length,
     키앞부분: k ? k.slice(0, 6) + '…' : '(없음)',
-    키형식: k.startsWith('AIza') ? '정상 (AIza 로 시작)' : '이상 — Google API 키는 보통 AIza 로 시작합니다',
+    키형식: (k.startsWith('AIza') || k.startsWith('AQ.')) ? '정상' : '못 보던 형식입니다',
     공백섞임: k !== String(env.GEMINI_API_KEY || '')
   };
   if (!k) { out.error = 'GEMINI_API_KEY 가 설정되지 않았습니다.'; return out; }
@@ -792,14 +806,16 @@ async function probeGemini(env, lang) {
 
     out.응답 = await new Promise(resolve => {
       const timer = setTimeout(() => resolve('(8초 동안 아무 응답 없음)'), 8000);
-      ws.addEventListener('message', e => {
+      ws.addEventListener('message', async e => {
         clearTimeout(timer);
-        let s = String(e.data);
+        let s;
+        try { s = await wsText(e.data); } catch (err) { s = '(읽기 실패: ' + err.message + ')'; }
         try {
           const j = JSON.parse(s);
           if (j.setupComplete) { out.setupComplete = true; s = 'setupComplete — 준비 완료'; }
+          else if (j.error) s = '오류: ' + JSON.stringify(j.error).slice(0, 300);
         } catch (_) {}
-        resolve(s.slice(0, 400));
+        resolve(String(s).slice(0, 400));
       });
       ws.addEventListener('close', ev =>
         { clearTimeout(timer); resolve(`(닫힘 code=${ev.code} reason=${ev.reason || '없음'})`); });
