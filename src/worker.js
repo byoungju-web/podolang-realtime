@@ -26,10 +26,14 @@
 
 /* ===================== 설정 ===================== */
 
-// 지역차단이 나면 아래를 AI Gateway 주소로 바꾸세요 (기존 워커가 그렇게 우회 중입니다)
-// 예: wss://gateway.ai.cloudflare.com/v1/<ACCOUNT_ID>/<GATEWAY>/openai/v1/realtime/translations
-const RT_URL = 'wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate';
 const RT_MODEL_NOTE = 'gpt-realtime-translate';
+
+// OpenAI 실시간 통역 소켓 주소 두 가지.
+// 지역차단이 나면 게이트웨이 쪽으로 갈아탑니다.
+// wrangler.toml 의 [vars] 에 RT_MODE = "gateway" 를 넣으면 바뀝니다.
+const RT_DIRECT  = 'wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate';
+const RT_GATEWAY = `wss://gateway.ai.cloudflare.com/v1/8e3361d320715cc98e7b66cb3127ca76/podolang/openai?model=gpt-realtime-translate`;
+const rtUrl = env => (env && env.RT_MODE === 'gateway') ? RT_GATEWAY : RT_DIRECT;
 
 // 체인 폴백(태국어 등)에 쓰는 기존 파이프라인 — 지역차단 우회를 위해 게이트웨이 경유
 const CF_ACCOUNT_ID = '8e3361d320715cc98e7b66cb3127ca76';
@@ -66,7 +70,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '2.5',
+          ok: true, app: 'podolang-realtime', version: '2.6',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
@@ -75,6 +79,25 @@ export default {
             twilio: !!(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_PHONE_NUMBER),
             durableObject: !!env.CALL
           }
+        }, 200, H);
+      }
+
+      // 전화를 걸지 않고 OpenAI 통역 소켓만 시험합니다.
+      // 브라우저로 그냥 열면 됩니다: /api/rt/testopenai
+      if (url.pathname === '/api/rt/testopenai') {
+        const which = url.searchParams.get('only') || '';
+        const jobs = [];
+        if (which !== 'gateway') jobs.push(['direct', RT_DIRECT]);
+        if (which !== 'direct')  jobs.push(['gateway', RT_GATEWAY]);
+        const results = {};
+        for (const [name, u] of jobs) results[name] = await probeRealtime(env, u);
+        return json({
+          ok: true,
+          nowUsing: (env.RT_MODE === 'gateway') ? 'gateway' : 'direct',
+          model: RT_MODEL_NOTE,
+          hasKey: !!env.OPENAI_API_KEY,
+          results,
+           도움말: 'ok:true 이고 firstMessage 에 session 관련 내용이 오면 그 경로가 쓸 수 있는 것입니다.'
         }, 200, H);
       }
 
@@ -477,14 +500,22 @@ export class CallSession {
    */
   async openTranslate(outLang, tag) {
     try {
-      const res = await fetch(RT_URL, {
+      const res = await fetch(rtUrl(this.env), {
         headers: {
           Upgrade: 'websocket',
-          Authorization: `Bearer ${this.env.OPENAI_API_KEY}`
+          Authorization: `Bearer ${this.env.OPENAI_API_KEY}`,
+          'OpenAI-Beta': 'realtime=v1'
         }
       });
       const ws = res.webSocket;
-      if (!ws) { this.toApp({ type: 'error', text: `통역 세션 연결 실패 (${tag})` }); return null; }
+      if (!ws) {
+        // 실패 이유를 남깁니다. 예전엔 조용히 넘어가서 원인을 못 봤습니다.
+        let body = '';
+        try { body = (await res.text()).slice(0, 300); } catch (_) {}
+        this.c.lastErr = `[${tag}] 세션 열기 실패 HTTP ${res.status} ${body}`;
+        this.toApp({ type: 'error', text: `통역 세션 연결 실패 (HTTP ${res.status})` });
+        return null;
+      }
       ws.accept();
 
       ws.send(JSON.stringify({
@@ -505,6 +536,7 @@ export class CallSession {
       ws.addEventListener('error', () => this.toApp({ type: 'error', text: `통역 세션 오류 (${tag})` }));
       return ws;
     } catch (e) {
+      this.c.lastErr = `[${tag}] 예외 ${e.message}`;
       this.toApp({ type: 'error', text: `통역 세션 예외 (${tag}): ${e.message}` });
       return null;
     }
@@ -663,6 +695,54 @@ export class CallSession {
     }
     this.sessMe = this.sessPeer = this.twilio = this.app = null;
   }
+}
+
+/* ===================== 연결 시험 ===================== */
+// 소켓을 열어보고 무슨 일이 생기는지 그대로 돌려줍니다.
+// 지역차단이면 HTTP 403 과 본문이, 모델명이 틀리면 에러 메시지가 옵니다.
+async function probeRealtime(env, url) {
+  const out = { url: url.replace(/\?.*$/, '?…'), ok: false };
+  if (!env.OPENAI_API_KEY) { out.error = 'OPENAI_API_KEY 없음'; return out; }
+  try {
+    const res = await fetch(url, {
+      headers: {
+        Upgrade: 'websocket',
+        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        'OpenAI-Beta': 'realtime=v1'
+      }
+    });
+    out.status = res.status;
+    const ws = res.webSocket;
+    if (!ws) {
+      try { out.body = (await res.text()).slice(0, 400); } catch (_) { out.body = '(본문 못 읽음)'; }
+      return out;
+    }
+    ws.accept();
+    out.upgraded = true;
+
+    out.firstMessage = await new Promise(resolve => {
+      const timer = setTimeout(() => resolve('(5초 동안 아무 응답 없음)'), 5000);
+      ws.addEventListener('message', e => {
+        clearTimeout(timer); resolve(String(e.data).slice(0, 400));
+      });
+      ws.addEventListener('close', ev => {
+        clearTimeout(timer); resolve(`(닫힘 code=${ev.code} reason=${ev.reason || '없음'})`);
+      });
+      ws.addEventListener('error', () => { clearTimeout(timer); resolve('(소켓 오류)'); });
+      try {
+        ws.send(JSON.stringify({
+          type: 'session.update',
+          session: { audio: { output: { language: 'ko' } } }
+        }));
+      } catch (e) { clearTimeout(timer); resolve('(보내기 실패: ' + e.message + ')'); }
+    });
+
+    out.ok = true;
+    try { ws.close(); } catch (_) {}
+  } catch (e) {
+    out.error = e.message;
+  }
+  return out;
 }
 
 /* ===================== 체인 폴백 (태국어 등) ===================== */
