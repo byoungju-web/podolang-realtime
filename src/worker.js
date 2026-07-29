@@ -35,7 +35,11 @@ const RT_MODEL_NOTE = 'gemini-3.1-flash-live-preview';
 const GEMINI_MODEL = 'gemini-3.1-flash-live-preview';
 const GEMINI_HOST  = 'https://generativelanguage.googleapis.com';
 const GEMINI_PATH  = '/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
-const geminiUrl = env => `${GEMINI_HOST}${GEMINI_PATH}?key=${encodeURIComponent(env.GEMINI_API_KEY || '')}`;
+const geminiKey = env => String((env && env.GEMINI_API_KEY) || '').trim();
+const geminiUrl = env => `${GEMINI_HOST}${GEMINI_PATH}?key=${encodeURIComponent(geminiKey(env))}`;
+// 주소의 ?key= 가 안 먹을 때를 대비해 헤더로도 같이 보냅니다.
+// Google API 는 x-goog-api-key 헤더를 동등하게 받아줍니다.
+const geminiHeaders = env => ({ Upgrade: 'websocket', 'x-goog-api-key': geminiKey(env) });
 
 const GEMINI_IN_RATE  = 16000;   // 우리가 보내는 소리
 const GEMINI_OUT_RATE = 24000;   // 받는 소리
@@ -89,7 +93,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '4.1',
+          ok: true, app: 'podolang-realtime', version: '4.2',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
@@ -527,7 +531,7 @@ export class CallSession {
       return null;
     }
     try {
-      const res = await fetch(geminiUrl(this.env), { headers: { Upgrade: 'websocket' } });
+      const res = await fetch(geminiUrl(this.env), { headers: geminiHeaders(this.env) });
       const ws = res.webSocket;
       if (!ws) {
         let body = '';
@@ -765,10 +769,18 @@ export class CallSession {
 // 지역차단이면 HTTP 403 과 본문이, 모델명이 틀리면 에러 메시지가 옵니다.
 // 세션을 열어보고 setupComplete 까지 오는지 확인합니다.
 async function probeGemini(env, lang) {
-  const out = { ok: false, 키있음: !!env.GEMINI_API_KEY };
-  if (!env.GEMINI_API_KEY) { out.error = 'GEMINI_API_KEY 가 설정되지 않았습니다.'; return out; }
+  const k = geminiKey(env);
+  const out = {
+    ok: false,
+    키있음: !!k,
+    키길이: k.length,
+    키앞부분: k ? k.slice(0, 6) + '…' : '(없음)',
+    키형식: k.startsWith('AIza') ? '정상 (AIza 로 시작)' : '이상 — Google API 키는 보통 AIza 로 시작합니다',
+    공백섞임: k !== String(env.GEMINI_API_KEY || '')
+  };
+  if (!k) { out.error = 'GEMINI_API_KEY 가 설정되지 않았습니다.'; return out; }
   try {
-    const res = await fetch(geminiUrl(env), { headers: { Upgrade: 'websocket' } });
+    const res = await fetch(geminiUrl(env), { headers: geminiHeaders(env) });
     out.status = res.status;
     const ws = res.webSocket;
     if (!ws) {
