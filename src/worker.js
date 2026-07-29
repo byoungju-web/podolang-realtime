@@ -66,7 +66,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '2.4',
+          ok: true, app: 'podolang-realtime', version: '2.5',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
@@ -163,11 +163,15 @@ export default {
             await stub.fetch(new Request('https://do/bump?k=twiml', { method: 'POST' }));
           } catch (_) {}
         }
-        const ws = `${url.origin.replace(/^http/, 'ws')}/rt/twilio?room=${room}`;
+        // ⚠️ <Stream> 의 url 에는 쿼리 문자열(?room=...)을 쓸 수 없습니다.
+        //    쓰면 Twilio 가 handshake 단계에서 거부합니다 (에러 31920).
+        //    그래서 방번호를 경로에 넣습니다. 부가 정보는 <Parameter> 로 넘깁니다.
+        const ws = `${url.origin.replace(/^http/, 'ws')}/rt/twilio/${encodeURIComponent(room)}`;
+        const cb = `${url.origin}/api/rt/streamstatus?room=${encodeURIComponent(room)}`;
         return xml(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${escXml(ws)}">
+    <Stream url="${escXml(ws)}" statusCallback="${escXml(cb)}">
       <Parameter name="room" value="${escXml(room)}"/>
     </Stream>
   </Connect>
@@ -175,18 +179,42 @@ export default {
       }
 
       // 3. WebSocket 두 갈래 — 둘 다 같은 Durable Object 로 넘깁니다
-      if (url.pathname === '/rt/app' || url.pathname === '/rt/twilio') {
+      if (url.pathname === '/rt/app' || url.pathname.startsWith('/rt/twilio')) {
         // 대소문자를 가리지 않습니다. Twilio 는 'WebSocket' 처럼 보낼 수 있습니다.
         const up = (request.headers.get('Upgrade') || '').toLowerCase();
         if (up !== 'websocket') {
           return new Response('WebSocket 연결이 필요합니다.', { status: 426 });
         }
-        const room = url.searchParams.get('room') || '';
+        // 앱은 ?room= 로, Twilio 는 경로 /rt/twilio/<room> 으로 옵니다
+        let room = url.searchParams.get('room') || '';
+        if (!room && url.pathname.startsWith('/rt/twilio/')) {
+          room = decodeURIComponent(url.pathname.slice('/rt/twilio/'.length));
+        }
         if (!room) return new Response('room 없음', { status: 400 });
         const stub = env.CALL.get(env.CALL.idFromName(room));
         // 원본 요청을 그대로 넘깁니다.
         // new Request(url, request) 로 다시 만들면 업그레이드가 깨질 수 있습니다.
         return stub.fetch(request);
+      }
+
+      // Twilio 가 스트림 상태를 알려주는 곳 (실패 원인이 여기 남습니다)
+      if (url.pathname === '/api/rt/streamstatus' && request.method === 'POST') {
+        const room = url.searchParams.get('room') || '';
+        try {
+          const fd = await request.formData();
+          const info = {
+            event: String(fd.get('StreamEvent') || ''),
+            error: String(fd.get('StreamError') || ''),
+            sid: String(fd.get('StreamSid') || '')
+          };
+          if (room && env.CALL) {
+            const stub = env.CALL.get(env.CALL.idFromName(room));
+            await stub.fetch(new Request('https://do/streamstatus', {
+              method: 'POST', body: JSON.stringify(info)
+            }));
+          }
+        } catch (_) {}
+        return new Response('OK');
       }
 
       // 4. 체인 폴백 — 실시간이 안 되는 언어(태국어 등)로 내 말을 보낼 때
@@ -340,6 +368,15 @@ export class CallSession {
       this.enqueueToPeer(buf);
       return json({ ok: true, bytes: buf.length });
     }
+    if (p === '/streamstatus') {
+      const b = await request.json();
+      this.c.streamEvent = b.event || '';
+      if (b.error) this.c.streamError = b.error;
+      if (b.event === 'stream-error' || b.error) {
+        this.toApp({ type: 'error', text: '통화 음성 연결 실패: ' + (b.error || b.event) });
+      }
+      return json({ ok: true });
+    }
     if (p === '/bump') {
       const k = url.searchParams.get('k') || 'x';
       if (k === 'twiml') this.c.twimlHits = (this.c.twimlHits || 0) + 1;
@@ -384,8 +421,14 @@ export class CallSession {
     if (p === '/end') { this.shutdown('요청'); return json({ ok: true }); }
 
     // 워커가 원본 요청을 그대로 넘기므로 실제 경로로 들어옵니다
-    if (p === '/rt/app'    || p === '/ws/app')    { this.c.wsAppTry    = (this.c.wsAppTry||0)+1;    return this.accept(request, 'app'); }
-    if (p === '/rt/twilio' || p === '/ws/twilio') { this.c.wsTwilioTry = (this.c.wsTwilioTry||0)+1; return this.accept(request, 'twilio'); }
+    if (p === '/rt/app' || p === '/ws/app') {
+      this.c.wsAppTry = (this.c.wsAppTry||0)+1;
+      return this.accept(request, 'app');
+    }
+    if (p === '/ws/twilio' || p === '/rt/twilio' || p.startsWith('/rt/twilio/')) {
+      this.c.wsTwilioTry = (this.c.wsTwilioTry||0)+1;
+      return this.accept(request, 'twilio');
+    }
 
     return new Response('not found', { status: 404 });
   }
@@ -533,6 +576,9 @@ export class CallSession {
     if (d.event === 'start') {
       this.c.twStart++;
       this.streamSid = d.start && d.start.streamSid;
+      // <Parameter> 로 넘긴 값이 여기 들어옵니다
+      const cp = d.start && d.start.customParameters;
+      if (cp && cp.room && !this.room) this.room = cp.room;
       this.toApp({ type: 'status', state: 'phone-connected' });
       return;
     }
