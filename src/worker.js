@@ -31,8 +31,10 @@ const RT_MODEL_NOTE = 'gpt-realtime-translate';
 // OpenAI 실시간 통역 소켓 주소 두 가지.
 // 지역차단이 나면 게이트웨이 쪽으로 갈아탑니다.
 // wrangler.toml 의 [vars] 에 RT_MODE = "gateway" 를 넣으면 바뀝니다.
-const RT_DIRECT  = 'wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate';
-const RT_GATEWAY = `wss://gateway.ai.cloudflare.com/v1/8e3361d320715cc98e7b66cb3127ca76/podolang/openai?model=gpt-realtime-translate`;
+// ⚠️ Workers 의 fetch() 는 wss:// 를 받지 않습니다. https:// 로 쓰고
+//    Upgrade: websocket 헤더를 붙이면 런타임이 알아서 업그레이드합니다.
+const RT_DIRECT  = 'https://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate';
+const RT_GATEWAY = `https://gateway.ai.cloudflare.com/v1/8e3361d320715cc98e7b66cb3127ca76/podolang/openai?model=gpt-realtime-translate`;
 const rtUrl = env => (env && env.RT_MODE === 'gateway') ? RT_GATEWAY : RT_DIRECT;
 
 // 체인 폴백(태국어 등)에 쓰는 기존 파이프라인 — 지역차단 우회를 위해 게이트웨이 경유
@@ -70,7 +72,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '2.6',
+          ok: true, app: 'podolang-realtime', version: '2.7',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
@@ -500,7 +502,7 @@ export class CallSession {
    */
   async openTranslate(outLang, tag) {
     try {
-      const res = await fetch(rtUrl(this.env), {
+      const res = await fetch(String(rtUrl(this.env)).replace(/^wss:/, 'https:'), {
         headers: {
           Upgrade: 'websocket',
           Authorization: `Bearer ${this.env.OPENAI_API_KEY}`,
@@ -701,6 +703,7 @@ export class CallSession {
 // 소켓을 열어보고 무슨 일이 생기는지 그대로 돌려줍니다.
 // 지역차단이면 HTTP 403 과 본문이, 모델명이 틀리면 에러 메시지가 옵니다.
 async function probeRealtime(env, url) {
+  url = String(url).replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
   const out = { url: url.replace(/\?.*$/, '?…'), ok: false };
   if (!env.OPENAI_API_KEY) { out.error = 'OPENAI_API_KEY 없음'; return out; }
   try {
