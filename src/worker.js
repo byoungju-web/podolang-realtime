@@ -68,6 +68,13 @@ const ALLOWED = [
 const LC = { KO:'ko', TH:'th', EN:'en', JA:'ja', ZH:'zh', VI:'vi', ES:'es', ID:'id',
              DE:'de', FR:'fr', AR:'ar', IT:'it', RU:'ru', PT:'pt', HI:'hi' };
 const lc = v => LC[String(v||'').toUpperCase()] || String(v||'en').toLowerCase();
+
+// 통역 지시문에 넣을 언어 이름 (영어로 써야 모델이 정확히 알아듣습니다)
+const LNAME = {
+  KO:'Korean', EN:'English', JA:'Japanese', ZH:'Chinese', ES:'Spanish',
+  PT:'Portuguese', FR:'French', DE:'German', IT:'Italian', RU:'Russian',
+  HI:'Hindi', ID:'Indonesian', VI:'Vietnamese', TH:'Thai', AR:'Arabic', MS:'Malay'
+};
 const rtOk = v => RT_OUT.includes(lc(v));
 
 /* ===================== Worker 진입점 ===================== */
@@ -82,7 +89,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '4.0',
+          ok: true, app: 'podolang-realtime', version: '4.1',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
