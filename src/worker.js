@@ -66,7 +66,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '2.2',
+          ok: true, app: 'podolang-realtime', version: '2.3',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
@@ -123,7 +123,13 @@ export default {
         form.append('From', env.TWILIO_PHONE_NUMBER);
         form.append('Url', `${url.origin}/twiml/rt?room=${room}&peer=${peer}`);
         form.append('StatusCallback', `${url.origin}/api/rt/status?room=${room}`);
+        // 울림 · 받음 · 종료를 모두 받아야 앱이 "안 받았다"를 알 수 있습니다
+        form.append('StatusCallbackEvent', 'initiated');
+        form.append('StatusCallbackEvent', 'ringing');
+        form.append('StatusCallbackEvent', 'answered');
         form.append('StatusCallbackEvent', 'completed');
+        // 벨이 25초 넘게 울리면 끊습니다 (음성사서함으로 넘어가는 걸 막습니다)
+        form.append('Timeout', '25');
 
         const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Calls.json`, {
           method: 'POST',
@@ -233,14 +239,17 @@ export default {
         return json({ ok: true }, 200, H);
       }
 
-      // 6. Twilio 콜 상태 콜백
+      // 6. Twilio 콜 상태 콜백 — 앱에 그대로 전달합니다
       if (url.pathname === '/api/rt/status' && request.method === 'POST') {
         const room = url.searchParams.get('room') || '';
         try {
           const fd = await request.formData();
-          if (room && env.CALL && String(fd.get('CallStatus')) === 'completed') {
+          const st = String(fd.get('CallStatus') || '');
+          if (room && env.CALL) {
             const stub = env.CALL.get(env.CALL.idFromName(room));
-            await stub.fetch(new Request('https://do/end', { method: 'POST' }));
+            await stub.fetch(new Request('https://do/callstatus', {
+              method: 'POST', body: JSON.stringify({ status: st })
+            }));
           }
         } catch (_) {}
         return new Response('OK');
@@ -320,6 +329,33 @@ export class CallSession {
       const buf = new Uint8Array(await request.arrayBuffer());
       this.enqueueToPeer(buf);
       return json({ ok: true, bytes: buf.length });
+    }
+    if (p === '/callstatus') {
+      const b = await request.json();
+      const st = String(b.status || '');
+      // 끝난 것으로 봐야 하는 상태들
+      const dead = {
+        'busy':      '상대가 통화 중입니다.',
+        'no-answer': '상대가 받지 않았습니다.',
+        'failed':    '전화를 연결하지 못했습니다. 번호를 확인해 주세요.',
+        'canceled':  '통화가 취소되었습니다.',
+        'completed': '통화가 끝났습니다.'
+      };
+      const alive = {
+        'queued':      '전화 거는 중…',
+        'initiated':   '전화 거는 중…',
+        'ringing':     '상대 전화가 울리고 있습니다…',
+        'in-progress': '상대가 받았습니다. 통역 준비 중…'
+      };
+      if (dead[st]) {
+        // 상대가 한 번도 안 받았는데 끝났으면 차단/스팸필터일 가능성이 큽니다
+        const blocked = !this.twilio && (st === 'completed' || st === 'no-answer' || st === 'busy');
+        this.toApp({ type: 'callstatus', text: dead[st], ended: true, blocked, raw: st });
+        this.shutdown(st);
+      } else if (alive[st]) {
+        this.toApp({ type: 'callstatus', text: alive[st], ended: false, raw: st });
+      }
+      return json({ ok: true });
     }
     if (p === '/debug') {
       const st = w => w ? w.readyState : -1;   // 1 = 열림
