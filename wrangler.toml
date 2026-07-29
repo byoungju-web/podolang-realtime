@@ -2,14 +2,17 @@ name = "podolang-realtime"
 main = "src/worker.js"
 compatibility_date = "2026-04-23"
 
-# 전화번호는 비밀이 아니라 여기 둡니다.
-# 대시보드에서 Text 로 넣으면 배포할 때마다 wrangler 가 지워버립니다.
+# 비밀이 아닌 값은 여기에 둡니다.
+# 대시보드에 Plaintext 로 넣으면 배포할 때마다 wrangler 가 지워버립니다.
 # (Secret 은 안 지워집니다 — 그래서 키들은 대시보드에 그대로 둡니다)
 [vars]
 TWILIO_PHONE_NUMBER = "+14472841160"
+CF_AIG_GATEWAY = "podolang-rt"
+RT_MODE = "gateway"          # gateway | gatewaypath | 지우면 직접연결
 
-# ⚠️ 아래 키들은 절대 여기에 쓰지 마세요. 이 파일은 GitHub 에 공개됩니다.
-#    OPENAI_API_KEY / TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / ELEVENLABS_API_KEY
+# ⚠️ 아래 값들은 절대 여기에 쓰지 마세요. 이 파일은 GitHub 에 공개됩니다.
+#    OPENAI_API_KEY / TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN /
+#    ELEVENLABS_API_KEY / CF_AIG_TOKEN
 #    → Cloudflare 대시보드에서 Secret 으로 넣으세요.
 
 [[durable_objects.bindings]]
@@ -17,6 +20,7 @@ name = "CALL"
 class_name = "CallSession"
 
 # 무료 플랜은 SQLite 백엔드 Durable Object 만 만들 수 있습니다.
+# new_classes 로 쓰면 배포가 실패합니다.
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["CallSession"]
