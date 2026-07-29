@@ -72,7 +72,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-relay', version: '5.0',
+          ok: true, app: 'podolang-relay', version: '5.1',
           mode: 'Twilio ConversationRelay — 음성은 Twilio, 번역만 워커',
           translateModel: TRANSLATE_MODEL,
           keys: {
@@ -90,8 +90,13 @@ export default {
         const to   = url.searchParams.get('to')   || 'en';
         try {
           const t0 = Date.now();
-          const out = await translateText(env, text, from, to);
-          return json({ ok: true, 원문: text, 번역: out, 걸린시간ms: Date.now() - t0 }, 200, H);
+          let first = 0;
+          const out = await translateStream(env, text, from, to, () => { if (!first) first = Date.now() - t0; });
+          return json({
+            ok: true, 원문: text, 번역: out,
+            첫조각까지ms: first,          // 상대가 소리를 듣기 시작하는 시점
+            전체완료ms: Date.now() - t0
+          }, 200, H);
         } catch (e) {
           return json({ ok: false, error: e.message }, 200, H);
         }
@@ -348,8 +353,10 @@ export class CallSession {
       this.c.prompts++;
       this.toApp({ type: 'heard', dir: 'peer', text: said });
       try {
-        const mine = await translateText(this.env, said, this.peer, this.me);
-        this.c.toApp++;
+        const mine = await translateStream(this.env, said, this.peer, this.me, piece => {
+          this.toApp({ type: 'chunk', dir: 'peer', delta: piece });
+          this.c.toApp++;
+        });
         this.toApp({ type: 'line', dir: 'peer', src: said, text: mine });
       } catch (e) {
         this.c.lastErr = '번역 실패: ' + e.message;
@@ -376,9 +383,12 @@ export class CallSession {
       if (!said) return;
       this.c.saysFromApp++;
       try {
-        const theirs = await translateText(this.env, said, this.me, this.peer);
-        this.toRelay({ type: 'text', token: theirs, last: true });
-        this.c.toRelay++;
+        // 조각이 나오는 대로 보내면 Twilio 가 첫 단어부터 바로 말합니다
+        const theirs = await translateStream(this.env, said, this.me, this.peer, piece => {
+          this.toRelay({ type: 'text', token: piece, last: false });
+          this.c.toRelay++;
+        });
+        this.toRelay({ type: 'text', token: '', last: true });   // 한 턴 끝
         this.toApp({ type: 'line', dir: 'me', src: said, text: theirs });
       } catch (e) {
         this.c.lastErr = '번역 실패: ' + e.message;
@@ -411,10 +421,9 @@ export class CallSession {
 
 /* ===================== 글자 번역 (게이트웨이 경유) ===================== */
 
-async function translateText(env, text, src, dst) {
-  if (!env.OPENAI_API_KEY) throw new Error('OpenAI 키가 없습니다.');
+function sysPrompt(src, dst) {
   const s = lname(src), t = lname(dst);
-  const sys = [
+  return [
     `You are a phone interpreter. Translate the user's line from ${s} into ${t}.`,
     `Output ONLY the translation. No quotes, no notes, no romanization, no explanation.`,
     `This is live business speech, so keep it natural and spoken, not literary.`,
@@ -422,6 +431,10 @@ async function translateText(env, text, src, dst) {
     `Keep the speaker's level of politeness.`,
     `If the line is already in ${t}, repeat it unchanged.`
   ].join(' ');
+}
+
+async function translateText(env, text, src, dst) {
+  if (!env.OPENAI_API_KEY) throw new Error('OpenAI 키가 없습니다.');
 
   const res = await fetch(`${OPENAI_HTTP}/chat/completions`, {
     method: 'POST',
@@ -430,7 +443,7 @@ async function translateText(env, text, src, dst) {
       model: TRANSLATE_MODEL,
       temperature: 0.2,
       max_tokens: 400,
-      messages: [{ role: 'system', content: sys }, { role: 'user', content: text }]
+      messages: [{ role: 'system', content: sysPrompt(src, dst) }, { role: 'user', content: text }]
     })
   });
   const raw = await res.text();
@@ -441,6 +454,56 @@ async function translateText(env, text, src, dst) {
   const out = d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
   if (!out) throw new Error('번역 결과가 비었습니다.');
   return out.trim();
+}
+
+/**
+ * 번역을 조각조각 흘려보냅니다.
+ * 전체가 끝나기를 기다리지 않아서 체감 지연이 크게 줄어듭니다.
+ * onToken(조각) 이 나올 때마다 불리고, 전체 문장을 돌려줍니다.
+ */
+async function translateStream(env, text, src, dst, onToken) {
+  if (!env.OPENAI_API_KEY) throw new Error('OpenAI 키가 없습니다.');
+  const res = await fetch(`${OPENAI_HTTP}/chat/completions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: TRANSLATE_MODEL,
+      temperature: 0.2,
+      max_tokens: 400,
+      stream: true,
+      messages: [
+        { role: 'system', content: sysPrompt(src, dst) },
+        { role: 'user', content: text }
+      ]
+    })
+  });
+  if (!res.ok || !res.body) {
+    const b = await res.text().catch(() => '');
+    throw new Error(`번역 실패 HTTP ${res.status} ${b.slice(0, 200)}`);
+  }
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '', full = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {          // SSE 는 줄 단위입니다
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (payload === '[DONE]') continue;
+      try {
+        const j = JSON.parse(payload);
+        const piece = j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content;
+        if (piece) { full += piece; onToken(piece); }
+      } catch (_) {}
+    }
+  }
+  return full.trim();
 }
 
 /* ===================== 유틸 ===================== */
