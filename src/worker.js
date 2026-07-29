@@ -34,8 +34,19 @@ const RT_MODEL_NOTE = 'gpt-realtime-translate';
 // ⚠️ Workers 의 fetch() 는 wss:// 를 받지 않습니다. https:// 로 쓰고
 //    Upgrade: websocket 헤더를 붙이면 런타임이 알아서 업그레이드합니다.
 const RT_DIRECT  = 'https://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate';
-const RT_GATEWAY = `https://gateway.ai.cloudflare.com/v1/8e3361d320715cc98e7b66cb3127ca76/podolang/openai?model=gpt-realtime-translate`;
-const rtUrl = env => (env && env.RT_MODE === 'gateway') ? RT_GATEWAY : RT_DIRECT;
+const GW_BASE = 'https://gateway.ai.cloudflare.com/v1/8e3361d320715cc98e7b66cb3127ca76/podolang/openai';
+// ① 문서에 나온 형태 — OpenAI 의 /v1/realtime 으로 연결됩니다
+const RT_GATEWAY = `${GW_BASE}?model=gpt-realtime-translate`;
+// ② 경로를 그대로 넘기는 형태 — /v1/realtime/translations 로 연결되기를 기대합니다
+const RT_GATEWAY_PATH = `${GW_BASE}/v1/realtime/translations?model=gpt-realtime-translate`;
+// wrangler.toml 의 [vars] 에 RT_MODE 를 넣어 갈아탑니다.
+//   "gateway"     → ①   "gatewaypath" → ②   없으면 직접연결
+const rtUrl = env => {
+  const m = env && env.RT_MODE;
+  if (m === 'gateway') return RT_GATEWAY;
+  if (m === 'gatewaypath') return RT_GATEWAY_PATH;
+  return RT_DIRECT;
+};
 
 // 체인 폴백(태국어 등)에 쓰는 기존 파이프라인 — 지역차단 우회를 위해 게이트웨이 경유
 const CF_ACCOUNT_ID = '8e3361d320715cc98e7b66cb3127ca76';
@@ -72,7 +83,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '2.9',
+          ok: true, app: 'podolang-realtime', version: '3.0',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
@@ -88,12 +99,11 @@ export default {
       // 브라우저로 그냥 열면 됩니다: /api/rt/testopenai
       if (url.pathname === '/api/rt/testopenai') {
         const results = {};
-        // 지금 쓰는 방식 (베타 헤더 없음) — 이게 되어야 합니다
-        results['direct(정상)'] = await probeRealtime(env, RT_DIRECT, null);
-        // 비교용: 베타 헤더를 붙이면 거부당하는 걸 보여줍니다
+        // 지역차단 때문에 직접연결은 막혀 있습니다. 게이트웨이 두 형태를 시험합니다.
+        results['gateway_모델파라미터'] = await probeRealtime(env, RT_GATEWAY, null);
+        results['gateway_경로그대로'] = await probeRealtime(env, RT_GATEWAY_PATH, null);
         if (url.searchParams.get('all') === '1') {
-          results['direct(베타헤더)'] = await probeRealtime(env, RT_DIRECT, { 'OpenAI-Beta': 'realtime=v1' });
-          results['gateway'] = await probeRealtime(env, RT_GATEWAY, null);
+          results['direct'] = await probeRealtime(env, RT_DIRECT, null);
         }
         return json({
           ok: true,
