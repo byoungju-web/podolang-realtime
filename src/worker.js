@@ -34,19 +34,32 @@ const RT_MODEL_NOTE = 'gpt-realtime-translate';
 // ⚠️ Workers 의 fetch() 는 wss:// 를 받지 않습니다. https:// 로 쓰고
 //    Upgrade: websocket 헤더를 붙이면 런타임이 알아서 업그레이드합니다.
 const RT_DIRECT  = 'https://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate';
-const GW_BASE = 'https://gateway.ai.cloudflare.com/v1/8e3361d320715cc98e7b66cb3127ca76/podolang/openai';
+// 게이트웨이 이름은 CF_AIG_GATEWAY 로 바꿀 수 있습니다 (기본 podolang-rt)
+const gwBase = env => `https://gateway.ai.cloudflare.com/v1/${CF_ACCOUNT_ID}/${(env && env.CF_AIG_GATEWAY) || 'podolang-rt'}/openai`;
 // ① 문서에 나온 형태 — OpenAI 의 /v1/realtime 으로 연결됩니다
-const RT_GATEWAY = `${GW_BASE}?model=gpt-realtime-translate`;
+const gwUrl     = env => `${gwBase(env)}?model=gpt-realtime-translate`;
 // ② 경로를 그대로 넘기는 형태 — /v1/realtime/translations 로 연결되기를 기대합니다
-const RT_GATEWAY_PATH = `${GW_BASE}/v1/realtime/translations?model=gpt-realtime-translate`;
+const gwUrlPath = env => `${gwBase(env)}/v1/realtime/translations?model=gpt-realtime-translate`;
 // wrangler.toml 의 [vars] 에 RT_MODE 를 넣어 갈아탑니다.
 //   "gateway"     → ①   "gatewaypath" → ②   없으면 직접연결
 const rtUrl = env => {
   const m = env && env.RT_MODE;
-  if (m === 'gateway') return RT_GATEWAY;
-  if (m === 'gatewaypath') return RT_GATEWAY_PATH;
+  if (m === 'gateway') return gwUrl(env);
+  if (m === 'gatewaypath') return gwUrlPath(env);
   return RT_DIRECT;
 };
+// 게이트웨이로 갈 때는 cf-aig-authorization 토큰이 있어야 합니다.
+// 없으면 게이트웨이가 401 Unauthorized 로 막습니다.
+function aigHeaders(env, url, style) {
+  const h = { Upgrade: 'websocket', Authorization: `Bearer ${env.OPENAI_API_KEY}` };
+  if (String(url).includes('gateway.ai.cloudflare.com') && env.CF_AIG_TOKEN) {
+    // 문서마다 Bearer 를 붙이는 예와 안 붙이는 예가 섞여 있어 둘 다 지원합니다
+    h['cf-aig-authorization'] = (style === 'bare')
+      ? env.CF_AIG_TOKEN
+      : `Bearer ${env.CF_AIG_TOKEN}`;
+  }
+  return h;
+}
 
 // 체인 폴백(태국어 등)에 쓰는 기존 파이프라인 — 지역차단 우회를 위해 게이트웨이 경유
 const CF_ACCOUNT_ID = '8e3361d320715cc98e7b66cb3127ca76';
@@ -83,14 +96,17 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '3.0',
+          ok: true, app: 'podolang-realtime', version: '3.1',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
             openai: !!env.OPENAI_API_KEY,
             elevenlabs: !!env.ELEVENLABS_API_KEY,
             twilio: !!(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_PHONE_NUMBER),
-            durableObject: !!env.CALL
+            durableObject: !!env.CALL,
+            aigToken: !!env.CF_AIG_TOKEN,
+            aigGateway: env.CF_AIG_GATEWAY || '(기본 podolang-rt)',
+            rtMode: env.RT_MODE || '(직접연결)'
           }
         }, 200, H);
       }
@@ -99,11 +115,13 @@ export default {
       // 브라우저로 그냥 열면 됩니다: /api/rt/testopenai
       if (url.pathname === '/api/rt/testopenai') {
         const results = {};
-        // 지역차단 때문에 직접연결은 막혀 있습니다. 게이트웨이 두 형태를 시험합니다.
-        results['gateway_모델파라미터'] = await probeRealtime(env, RT_GATEWAY, null);
-        results['gateway_경로그대로'] = await probeRealtime(env, RT_GATEWAY_PATH, null);
+        // 주소 두 형태 × 토큰 두 형식 = 네 조합을 한 번에 시험합니다
+        results['모델파라미터_Bearer'] = await probeRealtime(env, gwUrl(env), 'bearer');
+        results['모델파라미터_토큰만']  = await probeRealtime(env, gwUrl(env), 'bare');
+        results['경로그대로_Bearer']   = await probeRealtime(env, gwUrlPath(env), 'bearer');
+        results['경로그대로_토큰만']    = await probeRealtime(env, gwUrlPath(env), 'bare');
         if (url.searchParams.get('all') === '1') {
-          results['direct'] = await probeRealtime(env, RT_DIRECT, null);
+          results['직접연결'] = await probeRealtime(env, RT_DIRECT, null);
         }
         return json({
           ok: true,
@@ -516,12 +534,12 @@ export class CallSession {
     try {
       // ⚠️ 'OpenAI-Beta: realtime=v1' 를 붙이면 안 됩니다.
       //    옛 베타 규격으로 취급돼서 beta_api_shape_disabled 로 거부당합니다.
-      const res = await fetch(String(rtUrl(this.env)).replace(/^wss:/, 'https:'), {
-        headers: {
-          Upgrade: 'websocket',
-          Authorization: `Bearer ${this.env.OPENAI_API_KEY}`
-        }
-      });
+      const u = String(rtUrl(this.env)).replace(/^wss:/, 'https:');
+      let res = await fetch(u, { headers: aigHeaders(this.env, u, 'bearer') });
+      // Bearer 형식이 거부되면 토큰만 그대로 보내는 형식으로 한 번 더
+      if (!res.webSocket && res.status === 401 && u.includes('gateway.ai.cloudflare.com')) {
+        res = await fetch(u, { headers: aigHeaders(this.env, u, 'bare') });
+      }
       const ws = res.webSocket;
       if (!ws) {
         // 실패 이유를 남깁니다. 예전엔 조용히 넘어가서 원인을 못 봤습니다.
@@ -715,18 +733,13 @@ export class CallSession {
 /* ===================== 연결 시험 ===================== */
 // 소켓을 열어보고 무슨 일이 생기는지 그대로 돌려줍니다.
 // 지역차단이면 HTTP 403 과 본문이, 모델명이 틀리면 에러 메시지가 옵니다.
-async function probeRealtime(env, url, extra) {
+async function probeRealtime(env, url, style) {
   url = String(url).replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
-  const out = { url: url.replace(/\?.*$/, '?…'), ok: false };
+  const out = { url: url.replace(/\?.*$/, '?…'), 토큰형식: style || '없음', ok: false };
   if (!env.OPENAI_API_KEY) { out.error = 'OPENAI_API_KEY 없음'; return out; }
+  out.토큰있음 = !!env.CF_AIG_TOKEN;
   try {
-    const res = await fetch(url, {
-      headers: {
-        Upgrade: 'websocket',
-        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-        ...(extra || {})
-      }
-    });
+    const res = await fetch(url, { headers: aigHeaders(env, url, style) });
     out.status = res.status;
     const ws = res.webSocket;
     if (!ws) {
