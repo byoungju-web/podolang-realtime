@@ -72,7 +72,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-relay', version: '5.1',
+          ok: true, app: 'podolang-relay', version: '5.2',
           mode: 'Twilio ConversationRelay — 음성은 Twilio, 번역만 워커',
           translateModel: TRANSLATE_MODEL,
           keys: {
@@ -175,7 +175,7 @@ export default {
       transcriptionProvider="Deepgram"
       ttsProvider="ElevenLabs"
       welcomeGreeting="${escXml(greet(peer))}"
-      interruptible="speech"
+      interruptible="none"
       reportInputDuringAgentSpeech="none" />
   </Connect>
 </Response>`);
@@ -263,7 +263,10 @@ export class CallSession {
     this.callSid = '';
     this.closed = false;
     this.c = { twiml: 0, relayTry: 0, appTry: 0, prompts: 0, saysFromApp: 0,
-               toRelay: 0, toApp: 0, lastErr: '', lastRelayEvent: '' };
+               toRelay: 0, toApp: 0, queued: 0, lastErr: '', lastRelayEvent: '' };
+    // 번역을 한 번에 하나씩만 돌립니다.
+    // 두 개가 동시에 흐르면 조각이 뒤섞여 상대가 이상한 말을 듣게 됩니다.
+    this.sayChain = Promise.resolve();
   }
 
   async fetch(request) {
@@ -382,21 +385,29 @@ export class CallSession {
       const said = String(d.text || '').trim();
       if (!said) return;
       this.c.saysFromApp++;
-      try {
-        // 조각이 나오는 대로 보내면 Twilio 가 첫 단어부터 바로 말합니다
-        const theirs = await translateStream(this.env, said, this.me, this.peer, piece => {
-          this.toRelay({ type: 'text', token: piece, last: false });
-          this.c.toRelay++;
-        });
-        this.toRelay({ type: 'text', token: '', last: true });   // 한 턴 끝
-        this.toApp({ type: 'line', dir: 'me', src: said, text: theirs });
-      } catch (e) {
-        this.c.lastErr = '번역 실패: ' + e.message;
-        this.toApp({ type: 'error', text: '번역 실패: ' + e.message });
-      }
+      this.c.queued++;
+      // 앞의 번역이 끝난 뒤에 시작합니다 (조각이 뒤섞이지 않게)
+      this.sayChain = this.sayChain.then(() => this.sendOneSay(said)).catch(() => {});
       return;
     }
     if (d.type === 'bye') this.shutdown('앱 종료');
+  }
+
+  // 한 문장을 상대에게 보냅니다. 조각이 나오는 대로 흘려서 Twilio 가 바로 말하게 합니다.
+  async sendOneSay(said) {
+    try {
+      const theirs = await translateStream(this.env, said, this.me, this.peer, piece => {
+        this.toRelay({ type: 'text', token: piece, last: false });
+        this.c.toRelay++;
+      });
+      this.toRelay({ type: 'text', token: '', last: true });   // 한 턴 끝
+      this.toApp({ type: 'line', dir: 'me', src: said, text: theirs });
+    } catch (e) {
+      this.c.lastErr = '번역 실패: ' + e.message;
+      this.toApp({ type: 'error', text: '번역 실패: ' + e.message });
+    } finally {
+      this.c.queued = Math.max(0, this.c.queued - 1);
+    }
   }
 
   toApp(o) {
