@@ -66,7 +66,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '2.3',
+          ok: true, app: 'podolang-realtime', version: '2.4',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
@@ -156,6 +156,13 @@ export default {
       //    뒤에 <Dial> 같은 걸 붙이면 실행되지 않으니 넣지 마세요.
       if (url.pathname === '/twiml/rt') {
         const room = url.searchParams.get('room') || '';
+        // Twilio 가 TwiML 을 읽어갔다는 사실을 기록합니다
+        if (room && env.CALL) {
+          try {
+            const stub = env.CALL.get(env.CALL.idFromName(room));
+            await stub.fetch(new Request('https://do/bump?k=twiml', { method: 'POST' }));
+          } catch (_) {}
+        }
         const ws = `${url.origin.replace(/^http/, 'ws')}/rt/twilio?room=${room}`;
         return xml(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -169,14 +176,17 @@ export default {
 
       // 3. WebSocket 두 갈래 — 둘 다 같은 Durable Object 로 넘깁니다
       if (url.pathname === '/rt/app' || url.pathname === '/rt/twilio') {
-        if (request.headers.get('Upgrade') !== 'websocket') {
+        // 대소문자를 가리지 않습니다. Twilio 는 'WebSocket' 처럼 보낼 수 있습니다.
+        const up = (request.headers.get('Upgrade') || '').toLowerCase();
+        if (up !== 'websocket') {
           return new Response('WebSocket 연결이 필요합니다.', { status: 426 });
         }
         const room = url.searchParams.get('room') || '';
         if (!room) return new Response('room 없음', { status: 400 });
         const stub = env.CALL.get(env.CALL.idFromName(room));
-        const side = url.pathname === '/rt/app' ? 'app' : 'twilio';
-        return stub.fetch(new Request(`https://do/ws/${side}`, request));
+        // 원본 요청을 그대로 넘깁니다.
+        // new Request(url, request) 로 다시 만들면 업그레이드가 깨질 수 있습니다.
+        return stub.fetch(request);
       }
 
       // 4. 체인 폴백 — 실시간이 안 되는 언어(태국어 등)로 내 말을 보낼 때
@@ -330,6 +340,11 @@ export class CallSession {
       this.enqueueToPeer(buf);
       return json({ ok: true, bytes: buf.length });
     }
+    if (p === '/bump') {
+      const k = url.searchParams.get('k') || 'x';
+      if (k === 'twiml') this.c.twimlHits = (this.c.twimlHits || 0) + 1;
+      return json({ ok: true });
+    }
     if (p === '/callstatus') {
       const b = await request.json();
       const st = String(b.status || '');
@@ -368,8 +383,9 @@ export class CallSession {
     }
     if (p === '/end') { this.shutdown('요청'); return json({ ok: true }); }
 
-    if (p === '/ws/app')    return this.accept(request, 'app');
-    if (p === '/ws/twilio') return this.accept(request, 'twilio');
+    // 워커가 원본 요청을 그대로 넘기므로 실제 경로로 들어옵니다
+    if (p === '/rt/app'    || p === '/ws/app')    { this.c.wsAppTry    = (this.c.wsAppTry||0)+1;    return this.accept(request, 'app'); }
+    if (p === '/rt/twilio' || p === '/ws/twilio') { this.c.wsTwilioTry = (this.c.wsTwilioTry||0)+1; return this.accept(request, 'twilio'); }
 
     return new Response('not found', { status: 404 });
   }
