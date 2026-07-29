@@ -72,7 +72,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-realtime', version: '2.7',
+          ok: true, app: 'podolang-realtime', version: '2.9',
           model: RT_MODEL_NOTE,
           realtimeOutputLangs: RT_OUT,
           keys: {
@@ -87,12 +87,14 @@ export default {
       // 전화를 걸지 않고 OpenAI 통역 소켓만 시험합니다.
       // 브라우저로 그냥 열면 됩니다: /api/rt/testopenai
       if (url.pathname === '/api/rt/testopenai') {
-        const which = url.searchParams.get('only') || '';
-        const jobs = [];
-        if (which !== 'gateway') jobs.push(['direct', RT_DIRECT]);
-        if (which !== 'direct')  jobs.push(['gateway', RT_GATEWAY]);
         const results = {};
-        for (const [name, u] of jobs) results[name] = await probeRealtime(env, u);
+        // 지금 쓰는 방식 (베타 헤더 없음) — 이게 되어야 합니다
+        results['direct(정상)'] = await probeRealtime(env, RT_DIRECT, null);
+        // 비교용: 베타 헤더를 붙이면 거부당하는 걸 보여줍니다
+        if (url.searchParams.get('all') === '1') {
+          results['direct(베타헤더)'] = await probeRealtime(env, RT_DIRECT, { 'OpenAI-Beta': 'realtime=v1' });
+          results['gateway'] = await probeRealtime(env, RT_GATEWAY, null);
+        }
         return json({
           ok: true,
           nowUsing: (env.RT_MODE === 'gateway') ? 'gateway' : 'direct',
@@ -502,11 +504,12 @@ export class CallSession {
    */
   async openTranslate(outLang, tag) {
     try {
+      // ⚠️ 'OpenAI-Beta: realtime=v1' 를 붙이면 안 됩니다.
+      //    옛 베타 규격으로 취급돼서 beta_api_shape_disabled 로 거부당합니다.
       const res = await fetch(String(rtUrl(this.env)).replace(/^wss:/, 'https:'), {
         headers: {
           Upgrade: 'websocket',
-          Authorization: `Bearer ${this.env.OPENAI_API_KEY}`,
-          'OpenAI-Beta': 'realtime=v1'
+          Authorization: `Bearer ${this.env.OPENAI_API_KEY}`
         }
       });
       const ws = res.webSocket;
@@ -702,7 +705,7 @@ export class CallSession {
 /* ===================== 연결 시험 ===================== */
 // 소켓을 열어보고 무슨 일이 생기는지 그대로 돌려줍니다.
 // 지역차단이면 HTTP 403 과 본문이, 모델명이 틀리면 에러 메시지가 옵니다.
-async function probeRealtime(env, url) {
+async function probeRealtime(env, url, extra) {
   url = String(url).replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
   const out = { url: url.replace(/\?.*$/, '?…'), ok: false };
   if (!env.OPENAI_API_KEY) { out.error = 'OPENAI_API_KEY 없음'; return out; }
@@ -711,7 +714,7 @@ async function probeRealtime(env, url) {
       headers: {
         Upgrade: 'websocket',
         Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-        'OpenAI-Beta': 'realtime=v1'
+        ...(extra || {})
       }
     });
     out.status = res.status;
