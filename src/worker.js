@@ -168,7 +168,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-relay', version: '6.0',
+          ok: true, app: 'podolang-relay', version: '6.1',
           mode: 'Twilio ConversationRelay — 음성은 Twilio, 번역만 워커',
           translateModel: TRANSLATE_MODEL,
           keys: {
@@ -434,6 +434,10 @@ export class CallSession {
     // 번역을 한 번에 하나씩만 돌립니다.
     // 두 개가 동시에 흐르면 조각이 뒤섞여 상대가 이상한 말을 듣게 됩니다.
     this.sayChain = Promise.resolve();
+    // 상대 말이 잘게 쪼개져 오면 모아서 한 번에 번역합니다.
+    // 조각마다 번역하면 내 폰이 짧은 문장을 여러 번 읽어서 딸깍거립니다.
+    this.pBuf = '';
+    this.pTimer = null;
   }
 
   async fetch(request) {
@@ -522,16 +526,12 @@ export class CallSession {
       if (!said) return;
       this.c.prompts++;
       this.toApp({ type: 'heard', dir: 'peer', text: said });
-      try {
-        const mine = await translateStream(this.env, said, this.peer, this.me, piece => {
-          this.toApp({ type: 'chunk', dir: 'peer', delta: piece });
-          this.c.toApp++;
-        });
-        this.toApp({ type: 'line', dir: 'peer', src: said, text: mine });
-      } catch (e) {
-        this.c.lastErr = '번역 실패: ' + e.message;
-        this.toApp({ type: 'error', text: '번역 실패: ' + e.message });
-      }
+
+      // 0.9초 동안 새 말이 없으면 한 문장 끝난 것으로 보고 번역합니다
+      this.pBuf = (this.pBuf ? this.pBuf + ' ' : '') + said;
+      clearTimeout(this.pTimer);
+      if (this.pBuf.length >= 160) { this.flushPrompt(); }
+      else { this.pTimer = setTimeout(() => this.flushPrompt(), 900); }
       return;
     }
 
@@ -558,6 +558,24 @@ export class CallSession {
       return;
     }
     if (d.type === 'bye') this.shutdown('앱 종료');
+  }
+
+  // 모아둔 상대 말을 한 번에 번역해서 내 폰으로 보냅니다
+  async flushPrompt() {
+    clearTimeout(this.pTimer); this.pTimer = null;
+    const said = String(this.pBuf || '').trim();
+    this.pBuf = '';
+    if (!said) return;
+    try {
+      const mine = await translateStream(this.env, said, this.peer, this.me, piece => {
+        this.toApp({ type: 'chunk', dir: 'peer', delta: piece });
+        this.c.toApp++;
+      });
+      this.toApp({ type: 'line', dir: 'peer', src: said, text: mine });
+    } catch (e) {
+      this.c.lastErr = '번역 실패: ' + e.message;
+      this.toApp({ type: 'error', text: '번역 실패: ' + e.message });
+    }
   }
 
   // 한 문장을 상대에게 보냅니다. 조각이 나오는 대로 흘려서 Twilio 가 바로 말하게 합니다.
@@ -591,6 +609,7 @@ export class CallSession {
   shutdown(why) {
     if (this.closed) return;
     this.closed = true;
+    clearTimeout(this.pTimer); this.pTimer = null; this.pBuf = '';
     this.toApp({ type: 'status', state: 'ended', why });
     for (const s of [this.relay, this.app]) { try { s && s.close(); } catch (_) {} }
     this.relay = this.app = null;
