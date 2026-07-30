@@ -60,6 +60,102 @@ const GREET = {
 };
 const greet = v => GREET[up(v)] || GREET.EN;
 
+/* ===================== 이용권 (Cloudflare KV) =====================
+   저장 형태
+     lic:<CODE>  → 이용권 한 장
+     call:<SID>  → 이 통화가 어느 이용권 것인지 (끝날 때 차감하려고)
+
+   ⚠️ 검사는 반드시 워커에서 합니다.
+      앱에서 막으면 코드를 고쳐서 그냥 통과합니다.
+      API 키가 워커에만 있으니 문은 워커가 지켜야 합니다.                */
+
+// 헷갈리는 글자(0/O, 1/I/L)는 뺐습니다. 전화로 불러줄 수 있어야 합니다.
+const CODE_CHARS = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+function newCode() {
+  const r = new Uint8Array(8);
+  crypto.getRandomValues(r);
+  let a = '', b = '';
+  for (let i = 0; i < 4; i++) a += CODE_CHARS[r[i] % CODE_CHARS.length];
+  for (let i = 4; i < 8; i++) b += CODE_CHARS[r[i] % CODE_CHARS.length];
+  return `PODO-${a}-${b}`;
+}
+const normCode = c => String(c || '').trim().toUpperCase().replace(/\s/g, '');
+
+async function licGet(env, code) {
+  if (!env.LIC) return null;
+  return await env.LIC.get('lic:' + normCode(code), 'json');
+}
+async function licPut(env, code, rec) {
+  if (!env.LIC) return;
+  await env.LIC.put('lic:' + normCode(code), JSON.stringify(rec));
+}
+
+/**
+ * 이용권을 확인합니다. 쓸 수 있으면 { ok:true, rec }, 아니면 이유를 돌려줍니다.
+ * device 를 주면 기기 수도 함께 검사합니다.
+ */
+async function licCheck(env, code, device, needMinutes) {
+  if (!env.LIC) return { ok: false, reason: '이용권 저장소(KV)가 연결되지 않았습니다.' };
+  const c = normCode(code);
+  if (!c) return { ok: false, reason: '이용권 코드를 넣어주세요.' };
+
+  const rec = await licGet(env, c);
+  if (!rec) return { ok: false, reason: '없는 코드입니다. 다시 확인해 주세요.' };
+  if (rec.status !== 'active') return { ok: false, reason: '정지된 이용권입니다.' };
+
+  const now = Date.now();
+  if (rec.expiresAt && now > rec.expiresAt) {
+    return { ok: false, reason: '이용 기간이 끝났습니다.', rec };
+  }
+
+  const left = Math.max(0, (rec.callSecLimit || 0) - (rec.callSecUsed || 0));
+  if (needMinutes && left < 60) {
+    return { ok: false, reason: '남은 통역 시간이 없습니다. 충전이 필요합니다.', rec };
+  }
+
+  // 기기 등록 (한 이용권을 여러 사람이 돌려쓰는 걸 막습니다)
+  if (device) {
+    rec.devices = rec.devices || [];
+    if (!rec.devices.includes(device)) {
+      if (rec.devices.length >= (rec.maxDevices || 2)) {
+        return { ok: false, reason: `기기 ${rec.maxDevices || 2}대까지만 쓸 수 있습니다.`, rec };
+      }
+      rec.devices.push(device);
+      await licPut(env, c, rec);
+    }
+  }
+  return { ok: true, rec, code: c };
+}
+
+function licView(rec) {
+  if (!rec) return null;
+  const left = Math.max(0, (rec.callSecLimit || 0) - (rec.callSecUsed || 0));
+  const days = rec.expiresAt ? Math.ceil((rec.expiresAt - Date.now()) / 86400000) : null;
+  return {
+    plan: rec.plan || '개인',
+    status: rec.status,
+    남은분: Math.floor(left / 60),
+    쓴분: Math.floor((rec.callSecUsed || 0) / 60),
+    만료일: rec.expiresAt ? new Date(rec.expiresAt).toISOString().slice(0, 10) : '무기한',
+    남은일수: days,
+    기기: (rec.devices || []).length + ' / ' + (rec.maxDevices || 2)
+  };
+}
+
+// 통화가 끝나면 쓴 시간만큼 깎습니다. Twilio 는 분 단위로 과금하니 올림합니다.
+async function licDeduct(env, callSid, seconds) {
+  if (!env.LIC || !callSid) return;
+  const code = await env.LIC.get('call:' + callSid);
+  if (!code) return;
+  const rec = await licGet(env, code);
+  if (!rec) return;
+  const charge = Math.ceil(Math.max(0, seconds) / 60) * 60;
+  rec.callSecUsed = (rec.callSecUsed || 0) + charge;
+  rec.lastCallAt = Date.now();
+  await licPut(env, code, rec);
+  await env.LIC.delete('call:' + callSid);
+}
+
 /* ===================== Worker ===================== */
 
 export default {
@@ -72,13 +168,15 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-relay', version: '5.2',
+          ok: true, app: 'podolang-relay', version: '6.0',
           mode: 'Twilio ConversationRelay — 음성은 Twilio, 번역만 워커',
           translateModel: TRANSLATE_MODEL,
           keys: {
             openai: !!env.OPENAI_API_KEY,
             twilio: !!(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_PHONE_NUMBER),
-            durableObject: !!env.CALL
+            durableObject: !!env.CALL,
+            licenseStore: !!env.LIC,
+            adminKey: !!env.ADMIN_KEY
           }
         }, 200, H);
       }
@@ -102,16 +200,77 @@ export default {
         }
       }
 
+      // ---- 이용권 확인 (앱이 남은 시간을 보여줄 때 씁니다) ----
+      if (url.pathname === '/api/lic/check' && request.method === 'POST') {
+        const b = await request.json();
+        const r = await licCheck(env, b.code, b.device, false);
+        return json(r.ok
+          ? { ok: true, ...licView(r.rec) }
+          : { ok: false, reason: r.reason, ...(r.rec ? licView(r.rec) : {}) }, 200, H);
+      }
+
+      // ---- 이용권 발급 (사장님만) ----
+      //  POST /api/lic/issue
+      //  { adminKey, plan:'개인'|'비즈니스', days:365, minutes:0, maxDevices:2, memo:'홍길동 카톡' }
+      if (url.pathname === '/api/lic/issue' && request.method === 'POST') {
+        const b = await request.json();
+        if (!env.ADMIN_KEY || b.adminKey !== env.ADMIN_KEY) {
+          return json({ error: '권한이 없습니다.' }, 403, H);
+        }
+        if (!env.LIC) return json({ error: 'KV(LIC)가 연결되지 않았습니다.' }, 400, H);
+        const days = Number(b.days) > 0 ? Number(b.days) : 365;
+        const mins = Number(b.minutes) >= 0 ? Number(b.minutes) : 0;
+        const code = newCode();
+        const rec = {
+          plan: b.plan || '개인',
+          status: 'active',
+          issuedAt: Date.now(),
+          expiresAt: Date.now() + days * 86400000,
+          callSecLimit: mins * 60,
+          callSecUsed: 0,
+          maxDevices: Number(b.maxDevices) > 0 ? Number(b.maxDevices) : 2,
+          devices: [],
+          memo: String(b.memo || '')
+        };
+        await licPut(env, code, rec);
+        return json({ ok: true, code, ...licView(rec), memo: rec.memo }, 200, H);
+      }
+
+      // ---- 통역 시간 충전 / 기간 연장 (사장님만) ----
+      if (url.pathname === '/api/lic/topup' && request.method === 'POST') {
+        const b = await request.json();
+        if (!env.ADMIN_KEY || b.adminKey !== env.ADMIN_KEY) {
+          return json({ error: '권한이 없습니다.' }, 403, H);
+        }
+        const c = normCode(b.code);
+        const rec = await licGet(env, c);
+        if (!rec) return json({ error: '없는 코드입니다.' }, 404, H);
+        if (Number(b.addMinutes)) rec.callSecLimit = (rec.callSecLimit || 0) + Number(b.addMinutes) * 60;
+        if (Number(b.addDays))    rec.expiresAt = Math.max(Date.now(), rec.expiresAt || Date.now()) + Number(b.addDays) * 86400000;
+        if (b.status) rec.status = b.status;
+        if (b.resetDevices) rec.devices = [];
+        await licPut(env, c, rec);
+        return json({ ok: true, code: c, ...licView(rec), memo: rec.memo }, 200, H);
+      }
+
       // 1. 통화 시작
       if (url.pathname === '/api/rt/start' && request.method === 'POST') {
         if (!env.CALL) return json({ error: 'Durable Object(CALL)가 연결되지 않았습니다.' }, 400, H);
         if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_PHONE_NUMBER) {
           return json({ error: 'Twilio 설정이 없습니다.' }, 400, H);
         }
-        const { to, myLang, peerLang } = await request.json();
+        const body = await request.json();
+        const { to, myLang, peerLang } = body;
         if (!/^\+\d{8,15}$/.test(to || '')) {
           return json({ error: '전화번호는 +82… 처럼 국가번호부터 넣어주세요.' }, 400, H);
         }
+
+        // ⚠️ 여기가 문입니다. 이용권이 없으면 전화가 나가지 않습니다.
+        const lic = await licCheck(env, body.code, body.device, true);
+        if (!lic.ok) {
+          return json({ error: lic.reason, needLicense: true }, 402, H);
+        }
+
         const me = up(myLang || 'KO'), peer = up(peerLang || 'EN');
 
         const room = crypto.randomUUID().slice(0, 12);
@@ -143,9 +302,12 @@ export default {
         await stub.fetch(new Request('https://do/callsid', {
           method: 'POST', body: JSON.stringify({ callSid: d.sid })
         }));
+        // 통화가 끝날 때 어느 이용권에서 깎을지 적어둡니다 (12시간 뒤 자동 삭제)
+        try{ await env.LIC.put('call:' + d.sid, lic.code, { expirationTtl: 43200 }); }catch(_){}
 
         return json({
           ok: true, room, callSid: d.sid,
+          이용권: licView(lic.rec),
           wsUrl: `${url.origin.replace(/^http/, 'ws')}/rt/app?room=${room}`,
           message: `${to} 로 거는 중입니다.`
         }, 200, H);
@@ -231,6 +393,11 @@ export default {
         const room = url.searchParams.get('room') || '';
         try {
           const fd = await request.formData();
+          // 실제 통화 시간만큼 이용권에서 깎습니다
+          if (String(fd.get('CallStatus')) === 'completed') {
+            await licDeduct(env, String(fd.get('CallSid') || ''),
+                            parseInt(String(fd.get('CallDuration') || '0'), 10) || 0);
+          }
           if (room && env.CALL) {
             const stub = env.CALL.get(env.CALL.idFromName(room));
             await stub.fetch(new Request('https://do/callstatus', {
