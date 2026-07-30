@@ -168,7 +168,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-relay', version: '6.2',
+          ok: true, app: 'podolang-relay', version: '6.3',
           mode: 'Twilio ConversationRelay — 음성은 Twilio, 번역만 워커',
           translateModel: TRANSLATE_MODEL,
           keys: {
@@ -251,6 +251,42 @@ export default {
         if (b.resetDevices) rec.devices = [];
         await licPut(env, c, rec);
         return json({ ok: true, code: c, ...licView(rec), memo: rec.memo }, 200, H);
+      }
+
+      // ---- 녹음 조각을 글자로 (Whisper) ----
+      //  앱이 안드로이드 음성인식을 쓰지 않고 녹음해서 보냅니다.
+      //  그 소리를 켜고 끌 때마다 딸깍 소리가 나서 이 길로 왔습니다.
+      //  Whisper 는 게이트웨이 경유라 지역차단을 통과합니다 (확인된 경로).
+      if (url.pathname === '/api/stt' && request.method === 'POST') {
+        if (!env.OPENAI_API_KEY) return json({ error: 'OpenAI 키가 없습니다.' }, 400, H);
+        const fd = await request.formData();
+        const audio = fd.get('audio');
+        const lang = String(fd.get('lang') || 'ko').toLowerCase();
+
+        // 이용권이 있어야 씁니다. 없으면 남의 Whisper 가 됩니다.
+        const lic = await licCheck(env, String(fd.get('code') || ''), null, false);
+        if (!lic.ok) return json({ error: lic.reason, needLicense: true }, 402, H);
+
+        if (!audio || typeof audio.arrayBuffer !== 'function') {
+          return json({ error: '음성이 오지 않았습니다.' }, 400, H);
+        }
+        const form = new FormData();
+        form.append('file', audio, 'voice.webm');
+        form.append('model', 'whisper-1');
+        if (lang && lang !== 'auto') form.append('language', lang);
+        form.append('temperature', '0');
+
+        const r = await fetch(`${OPENAI_HTTP}/audio/transcriptions`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+          body: form
+        });
+        const raw = await r.text();
+        let d;
+        try { d = JSON.parse(raw); }
+        catch (_) { return json({ error: '음성 인식 응답을 읽지 못했습니다: ' + raw.slice(0, 200) }, 400, H); }
+        if (d.error) return json({ error: d.error.message || '음성 인식 실패' }, 400, H);
+        return json({ ok: true, text: String(d.text || '').trim() }, 200, H);
       }
 
       // 1. 통화 시작
