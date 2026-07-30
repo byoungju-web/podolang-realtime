@@ -168,7 +168,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-relay', version: '6.3',
+          ok: true, app: 'podolang-relay', version: '6.4',
           mode: 'Twilio ConversationRelay — 음성은 Twilio, 번역만 워커',
           translateModel: TRANSLATE_MODEL,
           keys: {
@@ -286,7 +286,7 @@ export default {
         try { d = JSON.parse(raw); }
         catch (_) { return json({ error: '음성 인식 응답을 읽지 못했습니다: ' + raw.slice(0, 200) }, 400, H); }
         if (d.error) return json({ error: d.error.message || '음성 인식 실패' }, 400, H);
-        return json({ ok: true, text: String(d.text || '').trim() }, 200, H);
+        return json({ ok: true, text: dedupeRepeat(String(d.text || '')) }, 200, H);
       }
 
       // 1. 통화 시작
@@ -624,6 +624,31 @@ export class CallSession {
     for (const s of [this.relay, this.app]) { try { s && s.close(); } catch (_) {} }
     this.relay = this.app = null;
   }
+}
+
+/**
+ * Whisper 가 같은 구절을 반복해서 내놓는 경우를 접어냅니다.
+ * 거의 무음인 소리를 주면 한 문장을 열 번씩 되풀이하는 알려진 현상입니다.
+ */
+function dedupeRepeat(text) {
+  let s = String(text || '').trim();
+  if (!s) return '';
+
+  // 1) 문장 단위로 잇달아 같은 것이 오면 하나만 남깁니다
+  const parts = s.split(/(?<=[.!?。？！])\s*/).map(x => x.trim()).filter(Boolean);
+  const out = [];
+  for (const p of parts) {
+    if (out.length && out[out.length - 1] === p) continue;
+    out.push(p);
+  }
+  s = out.join(' ');
+
+  // 2) 문장부호 없이 같은 구절이 세 번 이상 이어지면 하나만 남깁니다
+  s = s.replace(/(.{5,80}?)(?:\s*\1){2,}/g, '$1');
+
+  // 3) 그래도 지나치게 길면 자릅니다 (전화 한 마디로는 300자면 충분합니다)
+  if (s.length > 300) s = s.slice(0, 300);
+  return s.trim();
 }
 
 /* ===================== 글자 번역 (게이트웨이 경유) ===================== */
