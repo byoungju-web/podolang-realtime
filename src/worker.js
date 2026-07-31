@@ -168,7 +168,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-relay', version: '6.4',
+          ok: true, app: 'podolang-relay', version: '6.6',
           mode: 'Twilio ConversationRelay — 음성은 Twilio, 번역만 워커',
           translateModel: TRANSLATE_MODEL,
           keys: {
@@ -312,7 +312,8 @@ export default {
         const room = crypto.randomUUID().slice(0, 12);
         const stub = env.CALL.get(env.CALL.idFromName(room));
         await stub.fetch(new Request('https://do/config', {
-          method: 'POST', body: JSON.stringify({ room, me, peer })
+          method: 'POST',
+          body: JSON.stringify({ room, me, peer, glossary: body.glossary, tone: body.tone })
         }));
 
         const auth = btoa(`${env.TWILIO_ACCOUNT_SID}:${env.TWILIO_AUTH_TOKEN}`);
@@ -465,6 +466,9 @@ export class CallSession {
     this.room = '';
     this.callSid = '';
     this.closed = false;
+    this.glossary = '';        // 용어집 (앱 설정에서 옵니다)
+    this.tone = 'normal';      // 말투
+    this.hist = [];            // 최근 대화. 앞뒤 맥락을 주려고 들고 있습니다
     this.c = { twiml: 0, relayTry: 0, appTry: 0, prompts: 0, saysFromApp: 0,
                toRelay: 0, toApp: 0, lastErr: '', lastRelayEvent: '' };
     // 번역을 한 번에 하나씩만 돌립니다.
@@ -479,6 +483,8 @@ export class CallSession {
     if (p === '/config') {
       const b = await request.json();
       this.room = b.room || ''; this.me = up(b.me); this.peer = up(b.peer);
+      this.glossary = String(b.glossary || '').slice(0, 4000);
+      this.tone = ['formal','normal','casual'].includes(b.tone) ? b.tone : 'normal';
       return json({ ok: true });
     }
     if (p === '/callsid') {
@@ -492,7 +498,9 @@ export class CallSession {
     if (p === '/debug') {
       return json({
         ok: !this.closed, room: this.room, me: this.me, peer: this.peer,
-        appUp: !!this.app, relayUp: !!this.relay, callSid: this.callSid, counters: this.c
+        appUp: !!this.app, relayUp: !!this.relay, callSid: this.callSid,
+        말투: this.tone, 용어집줄수: this.glossary ? this.glossary.split(/\n+/).filter(Boolean).length : 0,
+        기억한줄: this.hist.length, counters: this.c
       });
     }
     if (p === '/callstatus') {
@@ -560,10 +568,12 @@ export class CallSession {
       this.toApp({ type: 'heard', dir: 'peer', text: said });
 
       try {
+        const opt = this.transOpt();
+        this.remember('peer', said);
         const mine = await translateStream(this.env, said, this.peer, this.me, piece => {
           this.toApp({ type: 'chunk', dir: 'peer', delta: piece });
           this.c.toApp++;
-        });
+        }, opt);
         this.toApp({ type: 'line', dir: 'peer', src: said, text: mine });
       } catch (e) {
         this.c.lastErr = '번역 실패: ' + e.message;
@@ -590,11 +600,13 @@ export class CallSession {
       if (!said) return;
       this.c.saysFromApp++;
       try {
+        const opt = this.transOpt();
+        this.remember('me', said);
         // 조각이 나오는 대로 보내면 Twilio 가 첫 단어부터 바로 말합니다
         const theirs = await translateStream(this.env, said, this.me, this.peer, piece => {
           this.toRelay({ type: 'text', token: piece, last: false });
           this.c.toRelay++;
-        });
+        }, opt);
         this.toRelay({ type: 'text', token: '', last: true });   // 한 턴 끝
         this.toApp({ type: 'line', dir: 'me', src: said, text: theirs });
       } catch (e) {
@@ -604,6 +616,21 @@ export class CallSession {
       return;
     }
     if (d.type === 'bye') this.shutdown('앱 종료');
+  }
+
+  // 대화를 기억합니다. 최근 8줄만 들고 있습니다.
+  remember(who, src) {
+    const s = String(src || '').trim();
+    if (!s) return;
+    this.hist.push({ who, src: s.slice(0, 200) });
+    if (this.hist.length > 8) this.hist = this.hist.slice(-8);
+  }
+  transOpt() {
+    return {
+      glossary: this.glossary,
+      tone: this.tone,
+      context: historyText(this.hist, this.me, this.peer)
+    };
   }
 
   toApp(o) {
@@ -653,16 +680,63 @@ function dedupeRepeat(text) {
 
 /* ===================== 글자 번역 (게이트웨이 경유) ===================== */
 
-function sysPrompt(src, dst) {
+// 말투 지시
+const TONE = {
+  formal: 'Register: polite and respectful, the way you speak to a client or a senior partner.',
+  normal: 'Register: ordinary polite business talk between regular trading partners.',
+  casual: 'Register: relaxed and friendly, the way two people who know each other well talk.'
+};
+
+function sysPrompt(src, dst, opt) {
+  opt = opt || {};
   const s = lname(src), t = lname(dst);
-  return [
-    `You are a phone interpreter. Translate the user's line from ${s} into ${t}.`,
-    `Output ONLY the translation. No quotes, no notes, no romanization, no explanation.`,
-    `This is live business speech, so keep it natural and spoken, not literary.`,
-    `Copy numbers, prices, quantities, dates and product codes exactly.`,
-    `Keep the speaker's level of politeness.`,
-    `If the line is already in ${t}, repeat it unchanged.`
-  ].join(' ');
+  const lines = [
+    `You are a live phone interpreter between two people. Render ONLY the line marked [LINE] from ${s} into ${t}.`,
+
+    // ── 원어민처럼 ──────────────────────────────
+    `Do not translate word for word. Say it the way a native ${t} speaker would actually say it`,
+    `in this exact situation, out loud, on a phone call. Use the wording, rhythm and softeners`,
+    `that native speakers really use. A literal rendering that is grammatically correct but sounds`,
+    `foreign is a failure.`,
+
+    // ── 그러나 없는 말은 만들지 않는다 ──────────
+    `CRITICAL: never add any fact, promise, date, quantity, reason or offer that was not said.`,
+    `This is a business call — an invented delivery date or price becomes a real dispute later.`,
+    `Natural wording is required; new information is forbidden. If the speaker was blunt or vague,`,
+    `stay blunt or vague — just sound native while doing it.`,
+
+    `Copy numbers, prices, quantities, dates and product codes exactly as spoken.`,
+    `Keep it about as long as the original. Do not pad it out.`,
+    `Output ONLY the line itself — no quotes, no notes, no romanization, no speaker labels.`,
+    `If the line is already in ${t}, repeat it unchanged.`,
+    TONE[opt.tone] || TONE.normal
+  ];
+
+  // 앞 대화를 보고 "그것", "거기" 같은 말이 무엇인지 알아내라고 시킵니다
+  lines.push(
+    `Earlier lines are given only as context. Use them to resolve pronouns,`,
+    `omitted subjects, and half-finished sentences. Never translate the context itself.`
+  );
+
+  // 용어집이 있으면 그대로 쓰게 합니다
+  const g = String(opt.glossary || '').trim();
+  if (g) {
+    lines.push(
+      `Always use these fixed translations. They are company terms, partner names and place names:`,
+      g.split(/\n+/).map(x => x.trim()).filter(Boolean).slice(0, 80).join(' ; ')
+    );
+  }
+  return lines.join(' ');
+}
+
+// 앞 대화를 사람이 읽는 모양으로 만듭니다
+function historyText(hist, meLang, peerLang) {
+  if (!hist || !hist.length) return '';
+  const rows = hist.slice(-6).map(h => {
+    const who = h.who === 'me' ? `A(${lname(meLang)})` : `B(${lname(peerLang)})`;
+    return `${who}: ${h.src}`;
+  });
+  return '[CONTEXT — earlier lines, do not translate]\n' + rows.join('\n') + '\n\n';
 }
 
 async function translateText(env, text, src, dst) {
@@ -675,7 +749,7 @@ async function translateText(env, text, src, dst) {
       model: TRANSLATE_MODEL,
       temperature: 0.2,
       max_tokens: 400,
-      messages: [{ role: 'system', content: sysPrompt(src, dst) }, { role: 'user', content: text }]
+      messages: [{ role: 'system', content: sysPrompt(src, dst, {}) }, { role: 'user', content: text }]
     })
   });
   const raw = await res.text();
@@ -693,8 +767,10 @@ async function translateText(env, text, src, dst) {
  * 전체가 끝나기를 기다리지 않아서 체감 지연이 크게 줄어듭니다.
  * onToken(조각) 이 나올 때마다 불리고, 전체 문장을 돌려줍니다.
  */
-async function translateStream(env, text, src, dst, onToken) {
+async function translateStream(env, text, src, dst, onToken, opt) {
   if (!env.OPENAI_API_KEY) throw new Error('OpenAI 키가 없습니다.');
+  opt = opt || {};
+  const body = (opt.context || '') + '[LINE]\n' + text;
   const res = await fetch(`${OPENAI_HTTP}/chat/completions`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
@@ -704,8 +780,8 @@ async function translateStream(env, text, src, dst, onToken) {
       max_tokens: 400,
       stream: true,
       messages: [
-        { role: 'system', content: sysPrompt(src, dst) },
-        { role: 'user', content: text }
+        { role: 'system', content: sysPrompt(src, dst, opt) },
+        { role: 'user', content: body }
       ]
     })
   });
