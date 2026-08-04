@@ -168,7 +168,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-relay', version: '6.6',
+          ok: true, app: 'podolang-relay', version: '6.7',
           mode: 'Twilio ConversationRelay — 음성은 Twilio, 번역만 워커',
           translateModel: TRANSLATE_MODEL,
           keys: {
@@ -287,6 +287,68 @@ export default {
         catch (_) { return json({ error: '음성 인식 응답을 읽지 못했습니다: ' + raw.slice(0, 200) }, 400, H); }
         if (d.error) return json({ error: d.error.message || '음성 인식 실패' }, 400, H);
         return json({ ok: true, text: dedupeRepeat(String(d.text || '')) }, 200, H);
+      }
+
+      // ---- 화면 글씨 묶음 번역 ----
+      //  앱의 긴 안내문을 한 번에 옮깁니다.
+      //  한 번 옮긴 것은 KV 에 넣어두고 다음부터는 그대로 꺼내 씁니다.
+      //  이용권이 없어도 씁니다. 화면 글씨는 누구나 읽어야 하니까요.
+      if (url.pathname === '/api/ui/translate' && request.method === 'POST') {
+        if (!env.OPENAI_API_KEY) return json({ error: 'OpenAI 키가 없습니다.' }, 400, H);
+        const b = await request.json();
+        const to = up(b.to || 'EN');
+        const items = Array.isArray(b.items) ? b.items.slice(0, 60) : [];
+        if (!items.length) return json({ ok: true, texts: {} }, 200, H);
+        if (to === 'KO') return json({ ok: true, texts: {} }, 200, H);
+
+        const ver = String(b.ver || '1');
+        const cacheKey = `ui:${to}:${ver}`;
+        if (env.LIC) {
+          const hit = await env.LIC.get(cacheKey, 'json');
+          if (hit) return json({ ok: true, cached: true, texts: hit }, 200, H);
+        }
+
+        // 줄마다 번호를 붙여 보내고 같은 번호로 돌려받습니다
+        const numbered = items.map((x, i) => `${i + 1}. ${String(x.ko || '').replace(/\n/g, ' ⏎ ')}`).join('\n');
+        const sys = [
+          `Translate each numbered line from Korean into ${lname(to)}.`,
+          `These are user-interface strings for a live interpreting app used by small business owners.`,
+          `Keep the same numbering and the same number of lines. One line per number.`,
+          `Keep HTML tags such as <b> and <br> exactly where they are.`,
+          `Keep the symbol ⏎ exactly where it is — it marks a line break.`,
+          `Keep product names, phone numbers and codes unchanged.`,
+          `Sound natural and plain, the way an app really speaks to its user. Do not translate word for word.`,
+          `Output only the numbered lines, nothing else.`
+        ].join(' ');
+
+        const res = await fetch(`${OPENAI_HTTP}/chat/completions`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: TRANSLATE_MODEL, temperature: 0.2, max_tokens: 4000,
+            messages: [{ role: 'system', content: sys }, { role: 'user', content: numbered }]
+          })
+        });
+        const raw = await res.text();
+        let d;
+        try { d = JSON.parse(raw); } catch (_) { return json({ error: '번역 응답을 읽지 못했습니다.' }, 400, H); }
+        if (d.error) return json({ error: d.error.message || '번역 실패' }, 400, H);
+        const out = (d.choices?.[0]?.message?.content || '').trim();
+
+        const map = {};
+        for (const line of out.split(/\n+/)) {
+          const m = /^\s*(\d+)[.)]\s*(.+)$/.exec(line);
+          if (!m) continue;
+          const idx = parseInt(m[1], 10) - 1;
+          if (items[idx]) map[items[idx].k] = m[2].trim().replace(/ ?⏎ ?/g, '\n');
+        }
+        // 빠진 줄은 원문 그대로 둡니다
+        for (const it of items) if (!map[it.k]) map[it.k] = it.ko;
+
+        if (env.LIC) {
+          try { await env.LIC.put(cacheKey, JSON.stringify(map), { expirationTtl: 60 * 60 * 24 * 180 }); } catch (_) {}
+        }
+        return json({ ok: true, texts: map }, 200, H);
       }
 
       // 1. 통화 시작
