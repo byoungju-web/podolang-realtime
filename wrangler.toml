@@ -5,14 +5,18 @@ compatibility_date = "2026-04-23"
 # 비밀이 아닌 값만 여기 둡니다.
 # 대시보드에 Plaintext 로 넣으면 배포할 때마다 wrangler 가 지워버립니다.
 # (Secret 은 안 지워집니다 — 그래서 키들은 대시보드에 그대로 둡니다)
+#
+# ⚠️ [vars] 는 파일에 딱 한 번만 써야 합니다.
+#    두 번 쓰면 뒤엣것만 남고 앞엣것은 통째로 사라집니다.
 [vars]
 TWILIO_PHONE_NUMBER = "+14472841160"
+TALK_API = "https://podotalk-api.hasin7jk.workers.dev"
 
 # ⚠️ 아래 값들은 절대 여기에 쓰지 마세요. 이 파일은 GitHub 에 공개됩니다.
-#    OPENAI_API_KEY / TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / ADMIN_KEY
+#    OPENAI_API_KEY / TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / ADMIN_KEY / LINK_KEY
 #    → Cloudflare 대시보드에서 Secret 으로 넣으세요.
 
-# 이용권 저장소
+# 통화 번호를 잠깐 적어두는 저장소
 [[kv_namespaces]]
 binding = "LIC"
 id = "23323b6ef380479295654318149de40f"
@@ -26,5 +30,3 @@ class_name = "CallSession"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["CallSession"]
-[vars]
-TALK_API = "https://podotalk-api.hasin7jk.workers.dev"
