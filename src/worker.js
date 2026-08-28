@@ -1,7 +1,16 @@
 /**
  * 🍇 PODOLANG RELAY — 전화 통역 (Twilio ConversationRelay 방식)
- * Cloudflare Workers + Durable Object · v5.0
+ * Cloudflare Workers + Durable Object · v7.0
  * © 2026 BJ LEE. All Rights Reserved.  (BJ LEE 전용)
+ *
+ * v7.0 에서 바뀐 것
+ *   이용권(KV)을 없애고 포도톡 크레딧 하나로 모았습니다.
+ *   손님이 이용권도 사고 크레딧도 사야 해서 헷갈렸고, 남은 양을
+ *   두 군데서 봐야 했습니다. 이제 포도톡 설정 → 크레딧 한 곳만 봅니다.
+ *
+ *   그리고 잔액만큼만 통화하도록 시간을 미리 재둡니다.
+ *   예전에는 1분치만 있으면 몇 시간이든 걸 수 있어서, 100크레딧 가진
+ *   사람이 30분을 통화하면 그대로 손해였습니다.
  *
  * 왜 이 구조인가
  *   Cloudflare 워커에서 OpenAI·Gemini 의 실시간 WebSocket 으로 나가면
@@ -27,6 +36,8 @@ const TRANSLATE_MODEL = 'gpt-4o-mini';
 const ALLOWED = [
   'https://podolang.kr',
   'https://www.podolang.kr',
+  'https://podotalk.kr',
+  'https://www.podotalk.kr',
   'https://byoungju-web.github.io',
   'http://localhost:8788'
 ];
@@ -60,99 +71,90 @@ const GREET = {
 };
 const greet = v => GREET[up(v)] || GREET.EN;
 
-/* ===================== 이용권 (Cloudflare KV) =====================
-   저장 형태
-     lic:<CODE>  → 이용권 한 장
-     call:<SID>  → 이 통화가 어느 이용권 것인지 (끝날 때 차감하려고)
+/* ===================== 크레딧 (포도톡과 하나로) =====================
+   예전에는 여기 KV 에 이용권 코드를 따로 두었습니다. 손님이 이용권도 사고
+   크레딧도 사야 해서 헷갈렸고, 남은 양을 두 군데서 봐야 했습니다.
+   이제 포도톡 크레딧 하나만 씁니다. 이 워커가 포도톡 서버에 물어보고 깎습니다.
 
    ⚠️ 검사는 반드시 워커에서 합니다.
       앱에서 막으면 코드를 고쳐서 그냥 통과합니다.
-      API 키가 워커에만 있으니 문은 워커가 지켜야 합니다.                */
+      API 키가 워커에만 있으니 문은 워커가 지켜야 합니다.
 
-// 헷갈리는 글자(0/O, 1/I/L)는 뺐습니다. 전화로 불러줄 수 있어야 합니다.
-const CODE_CHARS = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
-function newCode() {
-  const r = new Uint8Array(8);
-  crypto.getRandomValues(r);
-  let a = '', b = '';
-  for (let i = 0; i < 4; i++) a += CODE_CHARS[r[i] % CODE_CHARS.length];
-  for (let i = 4; i < 8; i++) b += CODE_CHARS[r[i] % CODE_CHARS.length];
-  return `PODO-${a}-${b}`;
-}
-const normCode = c => String(c || '').trim().toUpperCase().replace(/\s/g, '');
+   워커 설정에 두 가지를 넣어야 합니다 (Settings → Variables and Secrets)
+     TALK_API   (Text)   https://podotalk-api.hasin7jk.workers.dev
+     LINK_KEY   (Secret) 포도톡 워커에 넣은 것과 똑같은 글자
 
-async function licGet(env, code) {
-  if (!env.LIC) return null;
-  return await env.LIC.get('lic:' + normCode(code), 'json');
-}
-async function licPut(env, code, rec) {
-  if (!env.LIC) return;
-  await env.LIC.put('lic:' + normCode(code), JSON.stringify(rec));
-}
+   KV(LIC) 는 그대로 둡니다. 어느 통화가 누구 것인지 잠깐 적어두는 데 씁니다. */
 
-/**
- * 이용권을 확인합니다. 쓸 수 있으면 { ok:true, rec }, 아니면 이유를 돌려줍니다.
- * device 를 주면 기기 수도 함께 검사합니다.
- */
-async function licCheck(env, code, device, needMinutes) {
-  if (!env.LIC) return { ok: false, reason: '이용권 저장소(KV)가 연결되지 않았습니다.' };
-  const c = normCode(code);
-  if (!c) return { ok: false, reason: '이용권 코드를 넣어주세요.' };
+const CD_PHONE = 60;   // 전화통역 1분
+const CD_TALK  = 1;    // 마주보고 통역 한 마디
 
-  const rec = await licGet(env, c);
-  if (!rec) return { ok: false, reason: '없는 코드입니다. 다시 확인해 주세요.' };
-  if (rec.status !== 'active') return { ok: false, reason: '정지된 이용권입니다.' };
+const talkApi = env => String(env.TALK_API || 'https://podotalk-api.hasin7jk.workers.dev')
+  .replace(/\/+$/, '');
 
-  const now = Date.now();
-  if (rec.expiresAt && now > rec.expiresAt) {
-    return { ok: false, reason: '이용 기간이 끝났습니다.', rec };
+const uidOk = v => /^[a-zA-Z0-9_-]{6,64}$/.test(v || '');
+
+/* 얼마나 남았는지 물어봅니다 */
+async function cdBalance(env, uid) {
+  if (!env.LINK_KEY) return { ok: false, reason: '서버 설정이 끝나지 않았습니다. (LINK_KEY)' };
+  if (!uidOk(uid)) {
+    return { ok: false, reason: '포도톡에서 열어주세요. 사용자 정보가 없습니다.' };
   }
-
-  const left = Math.max(0, (rec.callSecLimit || 0) - (rec.callSecUsed || 0));
-  if (needMinutes && left < 60) {
-    return { ok: false, reason: '남은 통역 시간이 없습니다. 충전이 필요합니다.', rec };
+  try {
+    const r = await fetch(`${talkApi(env)}/link/credits?uid=${encodeURIComponent(uid)}`, {
+      headers: { 'X-Link-Key': env.LINK_KEY }
+    });
+    const d = await r.json();
+    if (!d || !d.ok) return { ok: false, reason: '크레딧을 확인하지 못했습니다.' };
+    return { ok: true, balance: d.balance || 0, minutes: d.minutes || 0 };
+  } catch (_) {
+    return { ok: false, reason: '크레딧 서버에 닿지 못했습니다.' };
   }
-
-  // 기기 등록 (한 이용권을 여러 사람이 돌려쓰는 걸 막습니다)
-  if (device) {
-    rec.devices = rec.devices || [];
-    if (!rec.devices.includes(device)) {
-      if (rec.devices.length >= (rec.maxDevices || 2)) {
-        return { ok: false, reason: `기기 ${rec.maxDevices || 2}대까지만 쓸 수 있습니다.`, rec };
-      }
-      rec.devices.push(device);
-      await licPut(env, c, rec);
-    }
-  }
-  return { ok: true, rec, code: c };
 }
 
-function licView(rec) {
-  if (!rec) return null;
-  const left = Math.max(0, (rec.callSecLimit || 0) - (rec.callSecUsed || 0));
-  const days = rec.expiresAt ? Math.ceil((rec.expiresAt - Date.now()) / 86400000) : null;
+/* 실제로 깎습니다. 모자라면 남은 만큼만 깎고 얼마를 깎았는지 돌려줍니다. */
+async function cdSpend(env, uid, amount, kind) {
+  if (!env.LINK_KEY || !uid || !amount) return { ok: false, took: 0 };
+  try {
+    const r = await fetch(`${talkApi(env)}/link/credits`, {
+      method: 'POST',
+      headers: { 'X-Link-Key': env.LINK_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uid, amount, kind: kind || 'podolang' })
+    });
+    return await r.json();
+  } catch (_) { return { ok: false, took: 0 }; }
+}
+
+/* 쓸 수 있는지 봅니다. needMinutes 를 주면 최소 1분치가 있는지까지 봅니다. */
+async function cdCheck(env, uid, needMinutes) {
+  const b = await cdBalance(env, uid);
+  if (!b.ok) return { ok: false, reason: b.reason };
+  if (needMinutes && b.balance < CD_PHONE) {
+    return { ok: false, reason: '크레딧이 모자랍니다. 포도톡 설정 → 크레딧에서 채워주세요.', balance: b.balance };
+  }
+  if (!needMinutes && b.balance <= 0) {
+    return { ok: false, reason: '크레딧이 없습니다. 포도톡 설정 → 크레딧에서 채워주세요.', balance: b.balance };
+  }
+  return { ok: true, balance: b.balance, minutes: b.minutes };
+}
+
+/* 앱에 보여줄 모양. 예전 licView 자리를 그대로 씁니다. */
+function cdView(b) {
   return {
-    plan: rec.plan || '개인',
-    status: rec.status,
-    남은분: Math.floor(left / 60),
-    쓴분: Math.floor((rec.callSecUsed || 0) / 60),
-    만료일: rec.expiresAt ? new Date(rec.expiresAt).toISOString().slice(0, 10) : '무기한',
-    남은일수: days,
-    기기: (rec.devices || []).length + ' / ' + (rec.maxDevices || 2)
+    plan: '크레딧',
+    status: 'active',
+    남은분: Math.floor((b.balance || 0) / CD_PHONE),
+    남은크레딧: b.balance || 0
   };
 }
 
-// 통화가 끝나면 쓴 시간만큼 깎습니다. Twilio 는 분 단위로 과금하니 올림합니다.
-async function licDeduct(env, callSid, seconds) {
+/* 통화가 끝나면 쓴 시간만큼 깎습니다. Twilio 는 분 단위로 과금하니 올림합니다. */
+async function cdDeductCall(env, callSid, seconds) {
   if (!env.LIC || !callSid) return;
-  const code = await env.LIC.get('call:' + callSid);
-  if (!code) return;
-  const rec = await licGet(env, code);
-  if (!rec) return;
-  const charge = Math.ceil(Math.max(0, seconds) / 60) * 60;
-  rec.callSecUsed = (rec.callSecUsed || 0) + charge;
-  rec.lastCallAt = Date.now();
-  await licPut(env, code, rec);
+  const uid = await env.LIC.get('call:' + callSid);
+  if (!uid) return;
+  const mins = Math.ceil(Math.max(0, seconds) / 60);
+  if (mins > 0) await cdSpend(env, uid, mins * CD_PHONE, 'phone');
   await env.LIC.delete('call:' + callSid);
 }
 
@@ -168,15 +170,15 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-relay', version: '6.7',
+          ok: true, app: 'podolang-relay', version: '7.0',
           mode: 'Twilio ConversationRelay — 음성은 Twilio, 번역만 워커',
           translateModel: TRANSLATE_MODEL,
           keys: {
             openai: !!env.OPENAI_API_KEY,
             twilio: !!(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_PHONE_NUMBER),
             durableObject: !!env.CALL,
-            licenseStore: !!env.LIC,
-            adminKey: !!env.ADMIN_KEY
+            callStore: !!env.LIC,
+            creditLink: !!(env.LINK_KEY && env.TALK_API)
           }
         }, 200, H);
       }
@@ -200,57 +202,14 @@ export default {
         }
       }
 
-      // ---- 이용권 확인 (앱이 남은 시간을 보여줄 때 씁니다) ----
+      // ---- 크레딧 확인 (앱이 남은 시간을 보여줄 때 씁니다) ----
+      //  발급·충전은 포도톡에서 합니다. 여기서는 보기만 합니다.
       if (url.pathname === '/api/lic/check' && request.method === 'POST') {
         const b = await request.json();
-        const r = await licCheck(env, b.code, b.device, false);
+        const r = await cdCheck(env, b.uid || '', false);
         return json(r.ok
-          ? { ok: true, ...licView(r.rec) }
-          : { ok: false, reason: r.reason, ...(r.rec ? licView(r.rec) : {}) }, 200, H);
-      }
-
-      // ---- 이용권 발급 (사장님만) ----
-      //  POST /api/lic/issue
-      //  { adminKey, plan:'개인'|'비즈니스', days:365, minutes:0, maxDevices:2, memo:'홍길동 카톡' }
-      if (url.pathname === '/api/lic/issue' && request.method === 'POST') {
-        const b = await request.json();
-        if (!env.ADMIN_KEY || b.adminKey !== env.ADMIN_KEY) {
-          return json({ error: '권한이 없습니다.' }, 403, H);
-        }
-        if (!env.LIC) return json({ error: 'KV(LIC)가 연결되지 않았습니다.' }, 400, H);
-        const days = Number(b.days) > 0 ? Number(b.days) : 365;
-        const mins = Number(b.minutes) >= 0 ? Number(b.minutes) : 0;
-        const code = newCode();
-        const rec = {
-          plan: b.plan || '개인',
-          status: 'active',
-          issuedAt: Date.now(),
-          expiresAt: Date.now() + days * 86400000,
-          callSecLimit: mins * 60,
-          callSecUsed: 0,
-          maxDevices: Number(b.maxDevices) > 0 ? Number(b.maxDevices) : 2,
-          devices: [],
-          memo: String(b.memo || '')
-        };
-        await licPut(env, code, rec);
-        return json({ ok: true, code, ...licView(rec), memo: rec.memo }, 200, H);
-      }
-
-      // ---- 통역 시간 충전 / 기간 연장 (사장님만) ----
-      if (url.pathname === '/api/lic/topup' && request.method === 'POST') {
-        const b = await request.json();
-        if (!env.ADMIN_KEY || b.adminKey !== env.ADMIN_KEY) {
-          return json({ error: '권한이 없습니다.' }, 403, H);
-        }
-        const c = normCode(b.code);
-        const rec = await licGet(env, c);
-        if (!rec) return json({ error: '없는 코드입니다.' }, 404, H);
-        if (Number(b.addMinutes)) rec.callSecLimit = (rec.callSecLimit || 0) + Number(b.addMinutes) * 60;
-        if (Number(b.addDays))    rec.expiresAt = Math.max(Date.now(), rec.expiresAt || Date.now()) + Number(b.addDays) * 86400000;
-        if (b.status) rec.status = b.status;
-        if (b.resetDevices) rec.devices = [];
-        await licPut(env, c, rec);
-        return json({ ok: true, code: c, ...licView(rec), memo: rec.memo }, 200, H);
+          ? { ok: true, ...cdView(r) }
+          : { ok: false, reason: r.reason }, 200, H);
       }
 
       // ---- 녹음 조각을 글자로 (Whisper) ----
@@ -263,13 +222,18 @@ export default {
         const audio = fd.get('audio');
         const lang = String(fd.get('lang') || 'ko').toLowerCase();
 
-        // 이용권이 있어야 씁니다. 없으면 남의 Whisper 가 됩니다.
-        const lic = await licCheck(env, String(fd.get('code') || ''), null, false);
-        if (!lic.ok) return json({ error: lic.reason, needLicense: true }, 402, H);
+        // 크레딧이 있어야 씁니다. 없으면 남의 Whisper 가 됩니다.
+        const sUid = String(fd.get('uid') || '');
+        const lic = await cdCheck(env, sUid, false);
+        if (!lic.ok) return json({ error: lic.reason, needCredit: true }, 402, H);
 
         if (!audio || typeof audio.arrayBuffer !== 'function') {
           return json({ error: '음성이 오지 않았습니다.' }, 400, H);
         }
+
+        // 먼저 깎고 부릅니다. 부르고 나서 깎으면 실패한 요청으로 얼마든지 뽑아갑니다.
+        await cdSpend(env, sUid, CD_TALK, 'talk');
+
         const form = new FormData();
         form.append('file', audio, 'voice.webm');
         form.append('model', 'whisper-1');
@@ -292,7 +256,7 @@ export default {
       // ---- 화면 글씨 묶음 번역 ----
       //  앱의 긴 안내문을 한 번에 옮깁니다.
       //  한 번 옮긴 것은 KV 에 넣어두고 다음부터는 그대로 꺼내 씁니다.
-      //  이용권이 없어도 씁니다. 화면 글씨는 누구나 읽어야 하니까요.
+      //  크레딧이 없어도 씁니다. 화면 글씨는 누구나 읽어야 하니까요.
       if (url.pathname === '/api/ui/translate' && request.method === 'POST') {
         if (!env.OPENAI_API_KEY) return json({ error: 'OpenAI 키가 없습니다.' }, 400, H);
         const b = await request.json();
@@ -363,11 +327,16 @@ export default {
           return json({ error: '전화번호는 +82… 처럼 국가번호부터 넣어주세요.' }, 400, H);
         }
 
-        // ⚠️ 여기가 문입니다. 이용권이 없으면 전화가 나가지 않습니다.
-        const lic = await licCheck(env, body.code, body.device, true);
+        // ⚠️ 여기가 문입니다. 크레딧이 없으면 전화가 나가지 않습니다.
+        const cUid = String(body.uid || '');
+        const lic = await cdCheck(env, cUid, true);
         if (!lic.ok) {
-          return json({ error: lic.reason, needLicense: true }, 402, H);
+          return json({ error: lic.reason, needCredit: true }, 402, H);
         }
+
+        // 잔액만큼만 통화할 수 있게 시간을 미리 재둡니다.
+        // 이게 없으면 100크레딧 가진 사람이 한 시간을 걸어 마이너스가 납니다.
+        const maxMin = Math.max(1, Math.floor(lic.balance / CD_PHONE));
 
         const me = up(myLang || 'KO'), peer = up(peerLang || 'EN');
 
@@ -389,6 +358,7 @@ export default {
         form.append('StatusCallbackEvent', 'answered');
         form.append('StatusCallbackEvent', 'completed');
         form.append('Timeout', '25');
+        form.append('TimeLimit', String(maxMin * 60));   // 잔액이 다하면 저절로 끊깁니다
 
         const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Calls.json`, {
           method: 'POST',
@@ -401,12 +371,13 @@ export default {
         await stub.fetch(new Request('https://do/callsid', {
           method: 'POST', body: JSON.stringify({ callSid: d.sid })
         }));
-        // 통화가 끝날 때 어느 이용권에서 깎을지 적어둡니다 (12시간 뒤 자동 삭제)
-        try{ await env.LIC.put('call:' + d.sid, lic.code, { expirationTtl: 43200 }); }catch(_){}
+        // 통화가 끝날 때 누구에게서 깎을지 적어둡니다 (12시간 뒤 자동 삭제)
+        try{ await env.LIC.put('call:' + d.sid, cUid, { expirationTtl: 43200 }); }catch(_){}
 
         return json({
           ok: true, room, callSid: d.sid,
-          이용권: licView(lic.rec),
+          크레딧: cdView(lic),
+          최대통화분: maxMin,
           wsUrl: `${url.origin.replace(/^http/, 'ws')}/rt/app?room=${room}`,
           message: `${to} 로 거는 중입니다.`
         }, 200, H);
@@ -492,10 +463,10 @@ export default {
         const room = url.searchParams.get('room') || '';
         try {
           const fd = await request.formData();
-          // 실제 통화 시간만큼 이용권에서 깎습니다
+          // 실제 통화 시간만큼 크레딧에서 깎습니다
           if (String(fd.get('CallStatus')) === 'completed') {
-            await licDeduct(env, String(fd.get('CallSid') || ''),
-                            parseInt(String(fd.get('CallDuration') || '0'), 10) || 0);
+            await cdDeductCall(env, String(fd.get('CallSid') || ''),
+                               parseInt(String(fd.get('CallDuration') || '0'), 10) || 0);
           }
           if (room && env.CALL) {
             const stub = env.CALL.get(env.CALL.idFromName(room));
@@ -507,7 +478,7 @@ export default {
         return new Response('OK');
       }
 
-      return new Response('🍇 PodoLang Relay · v5.0 · © BJ LEE', { headers: H });
+      return new Response('🍇 PodoLang Relay · v7.0 · © BJ LEE', { headers: H });
 
     } catch (e) {
       return json({ error: e.message || '처리 중 오류가 발생했습니다.' }, 500, H);
@@ -799,29 +770,6 @@ function historyText(hist, meLang, peerLang) {
     return `${who}: ${h.src}`;
   });
   return '[CONTEXT — earlier lines, do not translate]\n' + rows.join('\n') + '\n\n';
-}
-
-async function translateText(env, text, src, dst) {
-  if (!env.OPENAI_API_KEY) throw new Error('OpenAI 키가 없습니다.');
-
-  const res = await fetch(`${OPENAI_HTTP}/chat/completions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: TRANSLATE_MODEL,
-      temperature: 0.2,
-      max_tokens: 400,
-      messages: [{ role: 'system', content: sysPrompt(src, dst, {}) }, { role: 'user', content: text }]
-    })
-  });
-  const raw = await res.text();
-  let d;
-  try { d = JSON.parse(raw); }
-  catch (_) { throw new Error('번역 응답을 읽지 못했습니다: ' + raw.slice(0, 200)); }
-  if (d.error) throw new Error(d.error.message || JSON.stringify(d.error).slice(0, 200));
-  const out = d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
-  if (!out) throw new Error('번역 결과가 비었습니다.');
-  return out.trim();
 }
 
 /**
