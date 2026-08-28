@@ -852,3 +852,4 @@ function cors(request) {
 const xml = body => new Response(body, { headers: { 'Content-Type': 'text/xml' } });
 const json = (obj, status = 200, H = {}) =>
   new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json', ...H } });
+
