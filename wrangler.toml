@@ -26,3 +26,5 @@ class_name = "CallSession"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["CallSession"]
+[vars]
+TALK_API = "https://podotalk-api.hasin7jk.workers.dev"
