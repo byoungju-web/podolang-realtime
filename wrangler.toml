@@ -33,3 +33,4 @@ new_sqlite_classes = ["CallSession"]
 [[services]]
 binding = "TALK"
 service = "podotalk-api"
+
