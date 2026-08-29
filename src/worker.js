@@ -92,6 +92,18 @@ const CD_TALK  = 1;    // 마주보고 통역 한 마디
 const talkApi = env => String(env.TALK_API || 'https://podotalk-api.hasin7jk.workers.dev')
   .replace(/\/+$/, '');
 
+/* 같은 계정의 워커를 workers.dev 주소로 부르면 Cloudflare 가 막습니다
+   (error code 1042). 그래서 Service Binding(TALK) 으로 직접 부릅니다.
+   대시보드에서 Bindings → Service 로 podotalk-api 를 TALK 이라는 이름에
+   연결해 두어야 합니다. 연결이 없으면 예전처럼 주소로 부릅니다. */
+async function talkFetch(env, path, init) {
+  const req = new Request(talkApi(env) + path, init);
+  if (env.TALK && typeof env.TALK.fetch === 'function') {
+    return await env.TALK.fetch(req);
+  }
+  return await fetch(req);
+}
+
 const uidOk = v => /^[a-zA-Z0-9_-]{6,64}$/.test(v || '');
 
 /* 얼마나 남았는지 물어봅니다 */
@@ -101,14 +113,14 @@ async function cdBalance(env, uid) {
     return { ok: false, reason: '포도톡에서 열어주세요. 사용자 정보가 없습니다.' };
   }
   try {
-    const r = await fetch(`${talkApi(env)}/link/credits?uid=${encodeURIComponent(uid)}`, {
+    const r = await talkFetch(env, `/link/credits?uid=${encodeURIComponent(uid)}`, {
       headers: { 'X-Link-Key': env.LINK_KEY }
     });
     const d = await r.json();
     if (!d || !d.ok) return { ok: false, reason: '크레딧을 확인하지 못했습니다.' };
     return { ok: true, balance: d.balance || 0, minutes: d.minutes || 0 };
-  } catch (_) {
-    return { ok: false, reason: '크레딧 서버에 닿지 못했습니다.' };
+  } catch (e) {
+    return { ok: false, reason: '크레딧 서버에 닿지 못했습니다: ' + ((e && e.message) || e) };
   }
 }
 
@@ -116,7 +128,7 @@ async function cdBalance(env, uid) {
 async function cdSpend(env, uid, amount, kind) {
   if (!env.LINK_KEY || !uid || !amount) return { ok: false, took: 0 };
   try {
-    const r = await fetch(`${talkApi(env)}/link/credits`, {
+    const r = await talkFetch(env, `/link/credits`, {
       method: 'POST',
       headers: { 'X-Link-Key': env.LINK_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify({ uid, amount, kind: kind || 'podolang' })
@@ -170,7 +182,7 @@ export default {
       // 상태 확인
       if (url.pathname === '/api/rt/health') {
         return json({
-          ok: true, app: 'podolang-relay', version: '7.0',
+          ok: true, app: 'podolang-relay', version: '7.1',
           mode: 'Twilio ConversationRelay — 음성은 Twilio, 번역만 워커',
           translateModel: TRANSLATE_MODEL,
           keys: {
@@ -178,9 +190,27 @@ export default {
             twilio: !!(env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_PHONE_NUMBER),
             durableObject: !!env.CALL,
             callStore: !!env.LIC,
-            creditLink: !!(env.LINK_KEY && env.TALK_API)
+            creditLink: !!(env.LINK_KEY && env.TALK_API),
+            serviceBinding: !!env.TALK
           }
         }, 200, H);
+      }
+
+      /* 크레딧 연결 진단. 포도톡을 실제로 불러보고 받은 답을 그대로 보여줍니다. */
+      if (url.pathname === '/api/link/test') {
+        const uid = url.searchParams.get('uid') || 'test123456';
+        const out = { talkApi: talkApi(env), hasKey: !!env.LINK_KEY,
+                      serviceBinding: !!env.TALK, uid };
+        try {
+          const r = await talkFetch(env, `/link/credits?uid=${encodeURIComponent(uid)}`, {
+            headers: { 'X-Link-Key': env.LINK_KEY || '' }
+          });
+          out.status = r.status;
+          out.body = (await r.text()).slice(0, 400);
+        } catch (e) {
+          out.fetchError = (e && e.message) || String(e);
+        }
+        return json(out, 200, H);
       }
 
       // 번역만 따로 시험 (전화 없이) — 게이트웨이가 살아있는지 확인
@@ -478,7 +508,7 @@ export default {
         return new Response('OK');
       }
 
-      return new Response('🍇 PodoLang Relay · v7.0 · © BJ LEE', { headers: H });
+      return new Response('🍇 PodoLang Relay · v7.1 · © BJ LEE', { headers: H });
 
     } catch (e) {
       return json({ error: e.message || '처리 중 오류가 발생했습니다.' }, 500, H);
@@ -852,4 +882,3 @@ function cors(request) {
 const xml = body => new Response(body, { headers: { 'Content-Type': 'text/xml' } });
 const json = (obj, status = 200, H = {}) =>
   new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json', ...H } });
-
