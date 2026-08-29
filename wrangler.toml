@@ -30,4 +30,6 @@ class_name = "CallSession"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["CallSession"]
-
+[[services]]
+binding = "TALK"
+service = "podotalk-api"
