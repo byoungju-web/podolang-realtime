@@ -86,8 +86,9 @@ const greet = v => GREET[up(v)] || GREET.EN;
 
    KV(LIC) 는 그대로 둡니다. 어느 통화가 누구 것인지 잠깐 적어두는 데 씁니다. */
 
-const CD_PHONE = 60;   // 전화통역 1분
-const CD_TALK  = 1;    // 마주보고 통역 한 마디
+/* 1:1 (포도톡 크레딧 = coverfo 크레딧, 1 = 99원) */
+const CD_PHONE = 6;    // 전화통역 1분
+const CD_TALK  = 0.1;  // 마주보고 통역 한 마디
 
 const talkApi = env => String(env.TALK_API || 'https://podotalk-api.hasin7jk.workers.dev')
   .replace(/\/+$/, '');
